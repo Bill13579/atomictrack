@@ -81,3 +81,46 @@ pub fn max2_msb_masked(a: NumericType, b: NumericType) -> NumericType {
 pub fn min2_msb_masked(a: NumericType, b: NumericType) -> NumericType {
     if lte_msb_masked(b, a) { b } else { a }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAX_PUBLIC: NumericType = MSB - 1;
+
+    #[test]
+    fn distance_and_addition_wrap_at_the_reserved_bit() {
+        assert_eq!(dist_msb_masked(1, MAX_PUBLIC), 2);
+        assert_eq!(add_msb_masked(MAX_PUBLIC, 1), 0);
+        assert_eq!(add_msb_masked(MAX_PUBLIC - 1, 3), 1);
+    }
+
+    #[test]
+    fn comparisons_and_extrema_work_across_wrap() {
+        let older = MAX_PUBLIC - 1;
+        let middle = 0;
+        let newer = 1;
+
+        assert!(gte_msb_masked(newer, older));
+        assert!(gt_msb_masked(newer, older));
+        assert!(lte_msb_masked(older, newer));
+        assert!(lt_msb_masked(older, newer));
+        assert!(gte_msb_masked(middle, middle));
+        assert!(!gt_msb_masked(middle, middle));
+
+        assert_eq!(max2_msb_masked(older, newer), newer);
+        assert_eq!(min2_msb_masked(older, newer), older);
+        assert_eq!(max3_msb_masked(older, middle, newer), newer);
+        assert_eq!(max3_msb_masked(newer, older, middle), newer);
+    }
+
+    #[test]
+    fn comparison_boundary_excludes_exactly_half_the_ring() {
+        let furthest_unambiguous = NumericType::MAX / 4;
+        let exactly_half_the_ring = furthest_unambiguous + 1;
+
+        assert!(gte_msb_masked(furthest_unambiguous, 0));
+        assert!(!gte_msb_masked(exactly_half_the_ring, 0));
+        assert!(!gte_msb_masked(0, exactly_half_the_ring));
+    }
+}

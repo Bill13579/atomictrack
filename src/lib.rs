@@ -641,6 +641,33 @@ mod tests {
     }
 
     #[test]
+    fn same_id_can_identify_distinct_placements_after_a_hole() {
+        let track = AtomicTrack::new(4);
+        let hole = track.enter(1).unwrap();
+        let first = track.enter(5).unwrap();
+
+        track
+            .with_number(first, |lane| lane.raise_to(11).unwrap())
+            .unwrap();
+        track.leave(hole).unwrap();
+
+        let second = track.enter(5).unwrap();
+        track
+            .with_number(second, |lane| lane.raise_to(22).unwrap())
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(first.offset, 1);
+        assert_eq!(second.offset, 0);
+        assert_eq!(track.recover(5), Some(second));
+        assert_eq!(track.with_number(first, |lane| lane.get()).unwrap(), Ok(11));
+        assert_eq!(
+            track.with_number(second, |lane| lane.get()).unwrap(),
+            Ok(22)
+        );
+    }
+
+    #[test]
     fn ids_with_reserved_bit_are_rejected() {
         let track = AtomicTrack::new(4);
         assert_eq!(track.enter(SUSPENDED_BIT), Err(EnterError::InvalidId));
@@ -733,6 +760,55 @@ mod tests {
             track.with_number(b, |lane| lane.get()).unwrap().unwrap(),
             13
         );
+    }
+
+    #[test]
+    fn find_min_and_concurrent_leave_progress_across_wrap() {
+        let track = AtomicTrack::new(1);
+        let number = track.enter(1).unwrap();
+        let quarter = NumericType::MAX / 4;
+
+        for delta in [quarter, quarter, 1] {
+            let value = track
+                .with_number(number, |lane| lane.add(delta).unwrap())
+                .unwrap();
+            assert_eq!(track.find_min(), value);
+            assert_eq!(track.min(), value);
+        }
+
+        assert_eq!(track.min(), MAX_PUBLIC);
+        track.leave_concurrent(number).unwrap();
+        assert_eq!(track.find_min(), MAX_PUBLIC);
+
+        let replacement = track.enter(2).unwrap();
+        assert_eq!(
+            track.with_number(replacement, |lane| lane.get()).unwrap(),
+            Ok(0)
+        );
+        assert_eq!(track.find_min(), 0);
+        assert_eq!(track.min(), 0);
+    }
+
+    #[test]
+    fn raise_to_progresses_across_wrap() {
+        let track = AtomicTrack::new(1);
+        let number = track.enter(1).unwrap();
+        let quarter = NumericType::MAX / 4;
+
+        for delta in [quarter, quarter, 1] {
+            let value = track
+                .with_number(number, |lane| lane.add(delta).unwrap())
+                .unwrap();
+            assert_eq!(track.find_min(), value);
+        }
+
+        assert_eq!(track.min(), MAX_PUBLIC);
+        assert_eq!(
+            track.with_number(number, |lane| lane.raise_to(1)).unwrap(),
+            Ok(1)
+        );
+        assert_eq!(track.find_min(), 1);
+        assert_eq!(track.min(), 1);
     }
 
     #[test]
