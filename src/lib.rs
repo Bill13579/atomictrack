@@ -1,4 +1,8 @@
 //! Play with numbers.
+//! 
+//! A few things to note:
+//! - Once a number is entered, it pushes the floor up forever. Even after it is suspended, if that slot is ever reused again it will impose an arbitrary (based on who happened to use that slot before) floor on the new number that can be entered on that slot.
+//! - ...That's basically it for now.
 
 use core::ptr::NonNull;
 
@@ -18,36 +22,43 @@ use MSB as SUSPENDED_BIT;
 const EMPTY_ID: NumericType = 0;
 const KEY_LOCK_BIT: NumericType = SUSPENDED_BIT;
 
+/// Get only the key bits from a number, meaning everything other than the MSB.
 #[inline]
 const fn key_bits(key: NumericType) -> NumericType {
     key & !KEY_LOCK_BIT
 }
 
+/// Is the key's lock bit (which is the MSB) set? If it's set (and it's not empty, since if it's empty then it can't logically be locked, though that's obvious but the compiler will strip this out) then it's locked.
 #[inline]
 const fn is_key_locked(key: NumericType) -> bool {
     (key & KEY_LOCK_BIT) != 0 && key != EMPTY_ID
 }
 
+/// Return the number after setting the lock bit (which is the MSB), regardless of whether it was set already or not.
 #[inline]
 const fn lock_key(key: NumericType) -> NumericType {
     key | KEY_LOCK_BIT
 }
 
+/// Return the number after setting the suspended bit (which is the MSB), regardless of whether it was set already or not.
 #[inline]
 const fn with_suspended_bit(value: NumericType) -> NumericType {
     value | MSB
 }
 
+/// Get only the value bits from a number, meaning everything other than the MSB.
 #[inline]
 const fn without_suspended_bit(value: NumericType) -> NumericType {
     value & !MSB
 }
 
+/// Is the value's suspended bit (which is the MSB) set? If it's set then it's suspended.
 #[inline]
 const fn is_suspended(value: NumericType) -> bool {
     (value & MSB) != 0
 }
 
+/// A value can't be larger than MAX_PUBLIC (because of the reserved MSB), so this checks for that.
 #[inline]
 const fn is_valid_public_value(value: NumericType) -> bool {
     value <= MAX_PUBLIC
@@ -119,7 +130,7 @@ impl Clone for AtomicTrack {
             self.inner
                 .as_ref()
                 .handle_count
-                .fetch_add(1, Ordering::AcqRel);
+                .fetch_add(1, Ordering::Relaxed);
         }
         Self { inner: self.inner }
     }
@@ -129,7 +140,8 @@ impl Drop for AtomicTrack {
     fn drop(&mut self) {
         unsafe {
             let inner = self.inner.as_ref();
-            if inner.handle_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if inner.handle_count.fetch_sub(1, Ordering::Release) == 1 {
+                core::sync::atomic::fence(Ordering::Acquire);
                 drop(Box::from_raw(self.inner.as_ptr()));
             }
         }
