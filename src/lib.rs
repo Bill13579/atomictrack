@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Shiko Kudo
+// 
+// Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+// or the MIT license (http://opensource.org), at your option.
+
 //! Play with numbers.
 //! 
 //! A few things to note:
@@ -6,18 +12,20 @@
 
 use core::ptr::NonNull;
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-pub type AtomicType = AtomicU64;
-pub type NumericType = u64;
+// AtomicUsize for manual atomic reference counting and AtomicType for everything else.
+pub mod math;
+use math::{AtomicType, NumericType, MSB};
 
-const MSB: NumericType = NumericType::MAX - (NumericType::MAX >> 1);
 const MAX_PUBLIC: NumericType = MSB - 1;
 
 pub mod cache_padded;
 use cache_padded::CachePadded;
 
 use MSB as SUSPENDED_BIT;
+
+use crate::math::{gte_msb_masked, max2_msb_masked, max3_msb_masked, min2_msb_masked};
 
 const EMPTY_ID: NumericType = 0;
 const KEY_LOCK_BIT: NumericType = SUSPENDED_BIT;
@@ -91,7 +99,7 @@ impl Slot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NumberId {
-    pub id: u64,
+    pub id: NumericType,
     pub offset: u64,
 }
 
@@ -185,19 +193,19 @@ impl AtomicTrack {
         unsafe { self.inner.as_ref().find_min() }
     }
 
-    pub fn enter(&self, id: u64) -> Result<NumberId, EnterError> {
+    pub fn enter(&self, id: NumericType) -> Result<NumberId, EnterError> {
         self.enter_from(id, self.min())
     }
 
-    pub fn enter_from(&self, id: u64, at_least: NumericType) -> Result<NumberId, EnterError> {
+    pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
         unsafe { self.inner.as_ref().enter_from(id, at_least) }
     }
 
-    pub fn recover(&self, id: u64) -> Option<NumberId> {
+    pub fn recover(&self, id: NumericType) -> Option<NumberId> {
         unsafe { self.inner.as_ref().recover(id) }
     }
 
-    pub fn with_id<R>(&self, id: u64, f: impl FnOnce(Number<'_>) -> R) -> Result<R, NumberError> {
+    pub fn with_id<R>(&self, id: NumericType, f: impl FnOnce(Number<'_>) -> R) -> Result<R, NumberError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(NumberError::InvalidId);
         }
@@ -253,9 +261,7 @@ impl AtomicTrackInner {
             }
 
             let desired_value = if __concurrent_write_leave {
-                without_suspended_bit(current)
-                    .checked_add(1)
-                    .expect("number overflowed AtomicTrack's monotonic range")
+                without_suspended_bit(current.wrapping_add(1))
             } else {
                 without_suspended_bit(current)
             };
@@ -278,7 +284,7 @@ impl AtomicTrackInner {
         }
     }
 
-    fn enter_from(&self, id: u64, at_least: NumericType) -> Result<NumberId, EnterError> {
+    fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(EnterError::InvalidId);
         }
@@ -307,10 +313,12 @@ impl AtomicTrackInner {
                     let current = slot.value.load(Ordering::Acquire);
                     debug_assert!(is_suspended(current));
 
-                    // Resume from max(current_lane_floor, at_least, global_min)
-                    let desired = without_suspended_bit(current)
-                        .max(at_least)
-                        .max(self.min.load(Ordering::Acquire));
+                    // Resume from max(current_lane_floor, global_min, at_least)
+                    let desired = max3_msb_masked(
+                        without_suspended_bit(current),
+                        self.min.load(Ordering::Acquire),
+                        at_least,
+                    );
 
                     // CAS to enter active state
                     match slot.value.compare_exchange(
@@ -335,7 +343,7 @@ impl AtomicTrackInner {
         Err(EnterError::Full)
     }
 
-    fn recover(&self, id: u64) -> Option<NumberId> {
+    fn recover(&self, id: NumericType) -> Option<NumberId> {
         if id == EMPTY_ID || is_key_locked(id) {
             return None;
         }
@@ -377,7 +385,7 @@ impl AtomicTrackInner {
 
                 if !is_suspended(value) && key_bits(id_before) != EMPTY_ID {
                     active_max = Some(match active_max {
-                        Some(current) => current.max(number),
+                        Some(current) => max2_msb_masked(current, number),
                         None => number,
                     });
                 }
@@ -386,7 +394,14 @@ impl AtomicTrackInner {
             }
         }
 
-        let mut running_min = active_max.unwrap_or(0);
+        let mut running_min;
+        if let Some(active_max) = active_max {
+            running_min = active_max;
+        } else {
+            // If there are no active numbers at all, considering that we have to be wrapping-aware, we're just gonna return the current global min and not update it at all.
+            // `find_min` is lazy that way.
+            return self.min.load(Ordering::Acquire);
+        }
 
         'outer: for slot in self.slots.iter() {
             'retry: loop {
@@ -396,7 +411,7 @@ impl AtomicTrackInner {
                 'inner: while is_suspended(current) {
                     let current_value = without_suspended_bit(current);
 
-                    if current_value >= running_min {
+                    if gte_msb_masked(current_value, running_min) {
                         let id_after = slot.id.load(Ordering::Acquire);
                         if id_before != id_after {
                             std::hint::spin_loop();
@@ -427,15 +442,30 @@ impl AtomicTrackInner {
                 }
 
                 if key_bits(id_before) != EMPTY_ID {
-                    running_min = running_min.min(without_suspended_bit(current));
+                    running_min = min2_msb_masked(running_min, without_suspended_bit(current));
                 }
 
                 continue 'outer;
             }
         }
 
-        let previous = self.min.fetch_max(running_min, Ordering::AcqRel);
-        previous.max(running_min)
+        let mut current = self.min.load(Ordering::Relaxed);
+
+        let previous = loop {
+            let new_value = max2_msb_masked(current, running_min);
+
+            match self.min.compare_exchange_weak(
+                current,
+                new_value,
+                Ordering::AcqRel, // Successful read-modify-write
+                Ordering::Acquire, // Failed comparison is only a load
+            ) {
+                Ok(previous) => break previous,
+                Err(actual) => current = actual,
+            }
+        };
+
+        max2_msb_masked(previous, running_min)
     }
 
     fn offset_as_usize(&self, offset: u64) -> Result<usize, NumberError> {
@@ -457,7 +487,7 @@ impl AtomicTrackInner {
     }
 
     #[inline]
-    fn index_for(&self, id: u64) -> usize {
+    fn index_for(&self, id: NumericType) -> usize {
         (id as usize) & self.mask
     }
 
@@ -507,7 +537,7 @@ impl<'a> Number<'a> {
                 return Err(NumberError::NotFound);
             }
 
-            let desired = without_suspended_bit(current).max(at_least);
+            let desired = max2_msb_masked(without_suspended_bit(current), at_least);
 
             let key_after = self.slot.id.load(Ordering::Acquire);
             if key_before != key_after {
@@ -542,14 +572,7 @@ impl<'a> Number<'a> {
                 return Err(NumberError::NotFound);
             }
 
-            let base = without_suspended_bit(current);
-            let next = base
-                .checked_add(delta)
-                .expect("number overflowed AtomicTrack's monotonic range");
-            assert!(
-                is_valid_public_value(next),
-                "number overflowed AtomicTrack's monotonic range"
-            );
+            let next = without_suspended_bit(current.wrapping_add(delta));
 
             let key_after = self.slot.id.load(Ordering::Acquire);
             if key_before != key_after {
