@@ -1,0 +1,19 @@
+[package]
+name = "atomictrack"
+version = "0.1.0"
+edition = "2024"
+description = "A place to play with monotonic atomic numbers"
+homepage = "https://github.com/Bill13579/atomictrack"
+repository = "https://github.com/Bill13579/atomictrack"
+documentation = "https://docs.rs/atomictrack"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["no_std", "no_alloc"]
+categories = ["algorithms", "concurrency", "data-structures"]
+
+[features]
+default = []
+small-atomics = []  # marker feature for using 32-bit atomics
+no-cache-pad = []  # marker feature for not padding to cache line: can reduce performance based on use-case but saves memory
+
+[dependencies]
