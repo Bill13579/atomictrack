@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Shiko Kudo
-// 
+//
 // Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
 // or the MIT license (http://opensource.org), at your option.
 
@@ -69,7 +69,7 @@ pub fn max3_msb_masked(a: NumericType, b: NumericType, c: NumericType) -> Numeri
 }
 
 /// Two-way wrapping-aware max among two numbers with MSB masked out, assuming that ***all*** the numbers (not just these two, *all* of them) live within a MAX/**4** ***range in total*** basically.
-/// 
+///
 /// The additional requirement is because all values must fit inside a contiguous circular interval narrower than MAX/**4** (or 2^(BITS - 2)) (inclusive) for the max (and min for that matter) to be well-defined. If the values are too far apart, the max is utterly ambiguous. Who *knows* who is ahead and who is behind anymore?
 #[inline]
 pub fn max2_msb_masked(a: NumericType, b: NumericType) -> NumericType {

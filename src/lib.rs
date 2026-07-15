@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Shiko Kudo
-// 
+//
 // Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
 // or the MIT license (http://opensource.org), at your option.
 
 //! Play with numbers.
-//! 
+//!
 //! A few things to note:
 //! - Once a number is entered, it pushes the floor up forever. Even after it is suspended, if that slot is ever reused again it will impose an arbitrary (based on who happened to use that slot before) floor on the new number that can be entered on that slot.
 //! - ...That's basically it for now.
@@ -256,7 +256,7 @@ impl AtomicTrackInner {
 
             let key_after = slot.id.load(Ordering::Acquire);
             if key_before != key_after {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
 
@@ -277,7 +277,7 @@ impl AtomicTrackInner {
                     return Ok(());
                 }
                 Err(_) => {
-                    std::hint::spin_loop();
+                    core::hint::spin_loop();
                     continue;
                 }
             }
@@ -377,7 +377,7 @@ impl AtomicTrackInner {
                 let id_after = slot.id.load(Ordering::Acquire);
 
                 if id_before != id_after {
-                    std::hint::spin_loop();
+                    core::hint::spin_loop();
                     continue;
                 }
 
@@ -414,7 +414,7 @@ impl AtomicTrackInner {
                     if gte_msb_masked(current_value, running_min) {
                         let id_after = slot.id.load(Ordering::Acquire);
                         if id_before != id_after {
-                            std::hint::spin_loop();
+                            core::hint::spin_loop();
                             continue 'retry;
                         }
 
@@ -437,7 +437,7 @@ impl AtomicTrackInner {
 
                 let id_after = slot.id.load(Ordering::Acquire);
                 if id_before != id_after {
-                    std::hint::spin_loop();
+                    core::hint::spin_loop();
                     continue 'retry;
                 }
 
@@ -508,7 +508,7 @@ impl<'a> Number<'a> {
             let value = self.slot.value.load(Ordering::Acquire);
             let key_after = self.slot.id.load(Ordering::Acquire);
             if key_before != key_after {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
 
@@ -541,7 +541,7 @@ impl<'a> Number<'a> {
 
             let key_after = self.slot.id.load(Ordering::Acquire);
             if key_before != key_after {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
 
@@ -553,7 +553,7 @@ impl<'a> Number<'a> {
             ) {
                 Ok(_) => return Ok(desired),
                 Err(_) => {
-                    std::hint::spin_loop();
+                    core::hint::spin_loop();
                     continue;
                 }
             }
@@ -576,7 +576,7 @@ impl<'a> Number<'a> {
 
             let key_after = self.slot.id.load(Ordering::Acquire);
             if key_before != key_after {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
 
@@ -588,7 +588,7 @@ impl<'a> Number<'a> {
             ) {
                 Ok(_) => return Ok(next),
                 Err(_) => {
-                    std::hint::spin_loop();
+                    core::hint::spin_loop();
                     continue;
                 }
             }
