@@ -8,6 +8,9 @@
 //!
 //! A few things to note:
 //! - Once a number is entered, it pushes the floor up forever. Even after it is suspended, if that slot is ever reused again it will impose an arbitrary (based on who happened to use that slot before) floor on the new number that can be entered on that slot.
+//! - For any [`AtomicTrack`], all numbers must remain within a contiguous circular range narrower than MAX/**4** (or 2^(BITS - 2)) (inclusive) *at all times.* This is so that there is a well-defined "ahead" and "behind" relationship between numbers even across wraparounds (as in transitive ordering).
+//! - Greater than and less than comparisons use wrapping-aware versions internally, so you might be surprised at some of the behavior when seeing edge cases. For example, on a fresh track, `enter_from(id, MSB / 2)` will initialize the lane to 0, because the halfway point on the ring has no unambiguous ordering relative to zero. If you keep to the rule that all numbers remain within the circular range mentioned above though, you probably won't notice most of the time.
+//! - Keys are not guaranteed to be unique; rather, it's loosely unique in the sense that it will tell you if it finds during the probe when inserting that there is a slot with that key already (*if* it finds it, it might not) or with [`AtomicTrack::recover`] and [`AtomicTrack::with_id`], returning the first matching lane with no promises that the result is unique. The [`NumberId`] should be considered the actual unique key.
 //! - ...That's basically it for now.
 
 use core::ptr::NonNull;
