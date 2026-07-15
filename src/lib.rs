@@ -11,6 +11,8 @@
 //! - For any [`AtomicTrack`], all numbers must remain within a contiguous circular range narrower than MAX/**4** (or 2^(BITS - 2)) (inclusive) *at all times.* This is so that there is a well-defined "ahead" and "behind" relationship between numbers even across wraparounds (as in transitive ordering).
 //! - Greater than and less than comparisons use wrapping-aware versions internally, so you might be surprised at some of the behavior when seeing edge cases. For example, on a fresh track, `enter_from(id, MSB / 2)` will initialize the lane to 0, because the halfway point on the ring has no unambiguous ordering relative to zero. If you keep to the rule that all numbers remain within the circular range mentioned above though, you probably won't notice most of the time.
 //! - Keys are not guaranteed to be unique; rather, it's loosely unique in the sense that it will tell you if it finds during the probe when inserting that there is a slot with that key already (*if* it finds it, it might not) or with [`AtomicTrack::recover`] and [`AtomicTrack::with_id`], returning the first matching lane with no promises that the result is unique. The [`NumberId`] should be considered the actual unique key.
+//! - Unless there's a `_concurrent` version of a function present, otherwise all functions can be assumed thread-safe.
+//! - [`AtomicTrack`] is `Send` and `Sync` and you can [`Clone`] it because it has an internal atomic reference count.
 //! - ...That's basically it for now.
 
 use core::ptr::NonNull;
@@ -188,6 +190,7 @@ impl AtomicTrack {
         unsafe { self.inner.as_ref().slots.len() }
     }
 
+    /// [`find_min`](`AtomicTrack::find_min`) updates the current global min, this one just reads it.
     pub fn min(&self) -> NumericType {
         unsafe { self.inner.as_ref().min.load(Ordering::Acquire) }
     }
@@ -204,10 +207,12 @@ impl AtomicTrack {
         unsafe { self.inner.as_ref().enter_from(id, at_least) }
     }
 
+    /// Recover a [`NumberId`] from a key. This is usually fast but since it *can* scan the whole ring, keeping the [`NumberId`] directly is better.
     pub fn recover(&self, id: NumericType) -> Option<NumberId> {
         unsafe { self.inner.as_ref().recover(id) }
     }
 
+    /// Just like [`recover`](`AtomicTrack::recover`), this is usually fast but since it *can* scan the whole ring, using [`with_number`](`AtomicTrack::with_number`) is better if you can.
     pub fn with_id<R>(&self, id: NumericType, f: impl FnOnce(Number<'_>) -> R) -> Result<R, NumberError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(NumberError::InvalidId);
@@ -232,6 +237,7 @@ impl AtomicTrack {
         unsafe { self.inner.as_ref().__leave(number, false) }
     }
 
+    /// Use this if there's ever more than one thread that might be touching the same number concurrently. There aren't any performance penalties, but when this physical slot is reused later for a new entrant, they will have to enter at a value *at least* 1 greater than what was left behind (other conditions separate).
     pub fn leave_concurrent(&self, number: NumberId) -> Result<(), LeaveError> {
         unsafe { self.inner.as_ref().__leave(number, true) }
     }
