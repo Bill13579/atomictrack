@@ -16,6 +16,10 @@
 //! - ...That's basically it for now.
 
 #![no_std]
+#![cfg_attr(
+    all(target_family = "wasm", target_feature = "atomics"),
+    feature(stdarch_wasm_atomic_wait)
+)]
 
 extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
@@ -32,6 +36,15 @@ const MAX_PUBLIC: NumericType = MSB - 1;
 
 pub mod cache_padded;
 use cache_padded::CachePadded;
+
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    all(target_family = "wasm", target_feature = "atomics")
+))]
+pub mod futex;
 
 use MSB as SUSPENDED_BIT;
 
