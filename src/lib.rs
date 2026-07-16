@@ -15,6 +15,11 @@
 //! - [`AtomicTrack`] is `Send` and `Sync` and you can [`Clone`] it because it has an internal atomic reference count.
 //! - ...That's basically it for now.
 
+#![no_std]
+
+extern crate alloc;
+use alloc::{boxed::Box, vec::Vec};
+
 use core::ptr::NonNull;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -613,6 +618,8 @@ impl<'a> Number<'a> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use std::{
         sync::{Arc, Barrier},
         thread,
