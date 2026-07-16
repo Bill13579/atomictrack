@@ -231,11 +231,15 @@ impl AtomicTrack {
         number: NumberId,
         f: impl FnOnce(Number<'_>) -> R,
     ) -> Result<R, NumberError> {
+        self.number(number).map(f)
+    }
+
+    pub fn number(&self, number: NumberId) -> Result<Number<'_>, NumberError> {
         let slot = unsafe { self.inner.as_ref().get_slot_concurrent(number)? };
-        Ok(f(Number {
+        Ok(Number {
             slot,
             id: number.id,
-        }))
+        })
     }
 
     pub fn leave(&self, number: NumberId) -> Result<(), LeaveError> {
@@ -358,6 +362,14 @@ impl AtomicTrackInner {
     }
 
     fn recover(&self, id: NumericType) -> Option<NumberId> {
+        if let Some((number_id, false)) = self.__recover(id) {
+            Some(number_id)
+        } else {
+            None
+        }
+    }
+
+    fn __recover(&self, id: NumericType) -> Option<(NumberId, bool)> {
         if id == EMPTY_ID || is_key_locked(id) {
             return None;
         }
@@ -368,10 +380,13 @@ impl AtomicTrackInner {
             let slot = &self.slots[index];
             let current = slot.id.load(Ordering::Acquire);
             if key_bits(current) == id {
-                return Some(NumberId {
-                    id,
-                    offset: probe_offset as u64,
-                });
+                return Some((
+                    NumberId {
+                        id,
+                        offset: probe_offset as u64,
+                    },
+                    is_key_locked(current),
+                ));
             }
         }
 
