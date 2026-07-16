@@ -53,6 +53,9 @@ use crate::math::{gte_msb_masked, max2_msb_masked, max3_msb_masked, min2_msb_mas
 const EMPTY_ID: NumericType = 0;
 const KEY_LOCK_BIT: NumericType = SUSPENDED_BIT;
 
+#[cfg(feature = "waiting")]
+pub mod waiting;
+
 /// Get only the key bits from a number, meaning everything other than the MSB.
 #[inline]
 const fn key_bits(key: NumericType) -> NumericType {
