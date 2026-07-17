@@ -218,27 +218,22 @@ impl AtomicTrackWaiting {
                 futex_value_before = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
+            //NOTE: `recover` returns None and stops probing if it finds a slot with the right key but that is still locked, but this is fine because if it's locked it should soon be unlocked, at which point the thread that finished adding in the id to the slot will wake this thread up again, and it will recheck, and recover will then find it this time, so given the contract of finding whatever was the first to be found in the ring with the provided id, this is good.
             if let Some(number_id) = self.inner.recover(id) {
                 return Ok(number_id);
             }
 
+            i += 1;
+
             // If it's not, we do different things based on whether we've exhausted the number of spins we're willing to do.
-            if i < MAX_SPIN_LOOPS_BEFORE_SLEEP {
-                match &timeout_ns {
-                    Some((timeout_ns, start)) => {
-                        if start.elapsed().as_nanos() as u64 >= *timeout_ns {
-                            return Err(WaitError::NotFound);
-                        }
-                    },
-                    _ => {},
-                }
+            if i <= MAX_SPIN_LOOPS_BEFORE_SLEEP { // <= instead of < since the futex_value_before load and the futex_value_after load sandwiches a single spin. This means that `i` will always be one ahead of what futex_value_before sees, so we need to not go into the sleep path for one more iteration since futex_value_before is not ready.
                 core::hint::spin_loop();
             } else {
                 // Load the futex value again.
                 let futex_value_after = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire);
                 if futex_value_before != futex_value_after {
                     // The futex value has changed, so the number has also possibly changed. We need to recheck.
-                    continue;
+                    core::hint::spin_loop();
                 } else {
                     // Otherwise, we go to sleep.
                     match &timeout_ns {
@@ -253,10 +248,18 @@ impl AtomicTrackWaiting {
                             let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after);
                         },
                     }
+                    continue;
                 }
             }
 
-            i += 1;
+            match &timeout_ns {
+                Some((timeout_ns, start)) => {
+                    if start.elapsed().as_nanos() as u64 >= *timeout_ns {
+                        return Err(WaitError::NotFound);
+                    }
+                },
+                _ => {},
+            }
         }
     }
 
@@ -314,29 +317,17 @@ impl AtomicTrackWaiting {
                 value = Some(value_tmp);
             }
 
+            i += 1;
+
             // If it's not, we do different things based on whether we've exhausted the number of spins we're willing to do.
-            if i < MAX_SPIN_LOOPS_BEFORE_SLEEP {
-                match &timeout_ns {
-                    Some((timeout_ns, start)) => {
-                        if start.elapsed().as_nanos() as u64 >= *timeout_ns {
-                            match (value, &number) {
-                                (Some(value), Some((_, number_id))) => {
-                                    return Ok((false, without_suspended_bit(value), number_id.clone()));
-                                },
-                                _ => {},
-                            }
-                            return Err(WaitError::NotFound);
-                        }
-                    },
-                    _ => {},
-                }
+            if i <= MAX_SPIN_LOOPS_BEFORE_SLEEP { // <= instead of < since the futex_value_before load and the futex_value_after load sandwiches a single spin. This means that `i` will always be one ahead of what futex_value_before sees, so we need to not go into the sleep path for one more iteration since futex_value_before is not ready.
                 core::hint::spin_loop();
             } else {
                 // Load the futex value again.
                 let futex_value_after = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire);
                 if futex_value_before != futex_value_after {
                     // The futex value has changed, so the number has also possibly changed. We need to recheck.
-                    continue;
+                    core::hint::spin_loop();
                 } else {
                     // Otherwise, we go to sleep.
                     match &timeout_ns {
@@ -357,10 +348,24 @@ impl AtomicTrackWaiting {
                             let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after);
                         },
                     }
+                    continue;
                 }
             }
 
-            i += 1;
+            match &timeout_ns {
+                Some((timeout_ns, start)) => {
+                    if start.elapsed().as_nanos() as u64 >= *timeout_ns {
+                        match (value, &number) {
+                            (Some(value), Some((_, number_id))) => {
+                                return Ok((false, without_suspended_bit(value), number_id.clone()));
+                            },
+                            _ => {},
+                        }
+                        return Err(WaitError::NotFound);
+                    }
+                },
+                _ => {},
+            }
         }
     }
 
@@ -453,23 +458,17 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
                 return Ok((true, without_suspended_bit(value)));
             }
 
+            i += 1;
+
             // If it's not, we do different things based on whether we've exhausted the number of spins we're willing to do.
-            if i < MAX_SPIN_LOOPS_BEFORE_SLEEP {
-                match &timeout_ns {
-                    Some((timeout_ns, start)) => {
-                        if start.elapsed().as_nanos() as u64 >= *timeout_ns {
-                            return Ok((false, without_suspended_bit(value)));
-                        }
-                    },
-                    _ => {},
-                }
+            if i <= MAX_SPIN_LOOPS_BEFORE_SLEEP { // <= instead of < since the futex_value_before load and the futex_value_after load sandwiches a single spin. This means that `i` will always be one ahead of what futex_value_before sees, so we need to not go into the sleep path for one more iteration since futex_value_before is not ready.
                 core::hint::spin_loop();
             } else {
                 // Load the futex value again.
                 let futex_value_after = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire);
                 if futex_value_before != futex_value_after {
                     // The futex value has changed, so the number has also possibly changed. We need to recheck.
-                    continue;
+                    core::hint::spin_loop();
                 } else {
                     // Otherwise, we go to sleep.
                     match &timeout_ns {
@@ -484,10 +483,18 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
                             let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after);
                         },
                     }
+                    continue;
                 }
             }
 
-            i += 1;
+            match &timeout_ns {
+                Some((timeout_ns, start)) => {
+                    if start.elapsed().as_nanos() as u64 >= *timeout_ns {
+                        return Ok((false, without_suspended_bit(value)));
+                    }
+                },
+                _ => {},
+            }
         }
     }
 
@@ -504,12 +511,50 @@ mod tests {
     use super::*;
     use crate::{lock_key, math::MSB};
     use std::{
-        sync::{Arc, Barrier},
+        sync::{atomic::AtomicBool, Arc, Barrier},
         thread,
         time::Duration,
+        vec::Vec,
     };
 
     const TEST_TIMEOUT_NS: u64 = 2_000_000_000;
+
+    fn run_while_futex_is_hot<R>(
+        futex: &'static AtomicU32,
+        operation: impl FnOnce() -> R,
+    ) -> (R, Duration) {
+        const HOT_THREADS: usize = 4;
+        const WATCHDOG: Duration = Duration::from_secs(1);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(HOT_THREADS + 1));
+        let mut workers = Vec::with_capacity(HOT_THREADS);
+
+        for _ in 0..HOT_THREADS {
+            let stop = Arc::clone(&stop);
+            let ready = Arc::clone(&ready);
+            workers.push(thread::spawn(move || {
+                ready.wait();
+                let started = Instant::now();
+                while !stop.load(Ordering::Relaxed) && started.elapsed() < WATCHDOG {
+                    futex.fetch_add(1, Ordering::Release);
+                    let _ = futex::wake_all(futex);
+                }
+            }));
+        }
+
+        ready.wait();
+        let started = Instant::now();
+        let result = operation();
+        let elapsed = started.elapsed();
+
+        stop.store(true, Ordering::Relaxed);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        (result, elapsed)
+    }
 
     #[test]
     fn recover_ignores_an_entry_that_is_still_locked() {
@@ -603,6 +648,41 @@ mod tests {
             track.number(number_id).unwrap().wait_gte_timeout(5, 0),
             Ok((false, 3))
         );
+    }
+
+    #[test]
+    fn hot_shared_futex_bucket_does_not_starve_timed_waits() {
+        const TIMEOUT_NS: u64 = 25_000_000;
+        const MIN_ALLOWED: Duration = Duration::from_nanos(TIMEOUT_NS);
+        const MAX_ALLOWED: Duration = Duration::from_millis(500);
+
+        let track = AtomicTrackWaiting::new(1);
+        let number_id = track.enter(1).unwrap();
+
+        let (result, elapsed) = run_while_futex_is_hot(
+            get_futex(&track.inner.inner, 2),
+            || track.wait_for_timeout(2, TIMEOUT_NS),
+        );
+        assert_eq!(result, Err(WaitError::NotFound));
+        assert!(elapsed >= MIN_ALLOWED, "entry wait returned early after {elapsed:?}");
+        assert!(elapsed < MAX_ALLOWED, "entry wait took {elapsed:?}");
+
+        let (result, elapsed) = run_while_futex_is_hot(
+            get_futex(&track.inner.inner, number_id.id),
+            || track.wait_gte_timeout(number_id.id, 1, TIMEOUT_NS),
+        );
+        assert_eq!(result, Ok((false, 0, number_id)));
+        assert!(elapsed >= MIN_ALLOWED, "key wait returned early after {elapsed:?}");
+        assert!(elapsed < MAX_ALLOWED, "key wait took {elapsed:?}");
+
+        let number = track.number(number_id).unwrap();
+        let (result, elapsed) = run_while_futex_is_hot(
+            get_futex(&track.inner.inner, number_id.id),
+            || number.wait_gte_timeout(1, TIMEOUT_NS),
+        );
+        assert_eq!(result, Ok((false, 0)));
+        assert!(elapsed >= MIN_ALLOWED, "number wait returned early after {elapsed:?}");
+        assert!(elapsed < MAX_ALLOWED, "number wait took {elapsed:?}");
     }
 
     #[test]
