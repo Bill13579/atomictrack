@@ -511,13 +511,14 @@ mod tests {
     use super::*;
     use crate::{lock_key, math::MSB};
     use std::{
-        sync::{atomic::AtomicBool, Arc, Barrier},
+        sync::{atomic::AtomicBool, mpsc, Arc, Barrier},
         thread,
         time::Duration,
         vec::Vec,
     };
 
     const TEST_TIMEOUT_NS: u64 = 2_000_000_000;
+    const TEST_WATCHDOG: Duration = Duration::from_secs(2);
 
     fn run_while_futex_is_hot<R>(
         futex: &'static AtomicU32,
@@ -597,6 +598,50 @@ mod tests {
     }
 
     #[test]
+    fn blocking_entry_waits_wake_on_enter() {
+        let track = AtomicTrackWaiting::new(1);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let id_waiter_track = track.clone();
+        let id_waiter_barrier = Arc::clone(&barrier);
+        let (id_sender, id_receiver) = mpsc::sync_channel(1);
+        let id_waiter = thread::spawn(move || {
+            id_waiter_barrier.wait();
+            id_sender.send(id_waiter_track.wait_for(7)).unwrap();
+        });
+
+        let number_waiter_track = track.clone();
+        let number_waiter_barrier = Arc::clone(&barrier);
+        let (number_sender, number_receiver) = mpsc::sync_channel(1);
+        let number_waiter = thread::spawn(move || {
+            number_waiter_barrier.wait();
+            let result = number_waiter_track
+                .wait_for_number(7)
+                .map(|number| number.get().unwrap());
+            number_sender.send(result).unwrap();
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        let number_id = track.enter(7).unwrap();
+
+        assert_eq!(
+            id_receiver
+                .recv_timeout(TEST_WATCHDOG)
+                .expect("wait_for did not wake"),
+            Ok(number_id)
+        );
+        assert_eq!(
+            number_receiver
+                .recv_timeout(TEST_WATCHDOG)
+                .expect("wait_for_number did not wake"),
+            Ok(0)
+        );
+        id_waiter.join().unwrap();
+        number_waiter.join().unwrap();
+    }
+
+    #[test]
     fn key_wait_is_woken_when_the_number_advances() {
         let track = AtomicTrackWaiting::new(1);
         let number_id = track.enter(9).unwrap();
@@ -613,6 +658,49 @@ mod tests {
         track.number(number_id).unwrap().add(5).unwrap();
 
         assert_eq!(waiter.join().unwrap(), Ok((true, 5, number_id)));
+    }
+
+    #[test]
+    fn raise_to_wakes_blocking_key_and_number_waits() {
+        let track = AtomicTrackWaiting::new(1);
+        let number_id = track.enter(9).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let key_waiter_track = track.clone();
+        let key_waiter_barrier = Arc::clone(&barrier);
+        let (key_sender, key_receiver) = mpsc::sync_channel(1);
+        let key_waiter = thread::spawn(move || {
+            key_waiter_barrier.wait();
+            key_sender.send(key_waiter_track.wait_gte(9, 5)).unwrap();
+        });
+
+        let number_waiter_track = track.clone();
+        let number_waiter_barrier = Arc::clone(&barrier);
+        let (number_sender, number_receiver) = mpsc::sync_channel(1);
+        let number_waiter = thread::spawn(move || {
+            let number = number_waiter_track.number(number_id).unwrap();
+            number_waiter_barrier.wait();
+            number_sender.send(number.wait_gte(5)).unwrap();
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        track.number(number_id).unwrap().raise_to(5).unwrap();
+
+        assert_eq!(
+            key_receiver
+                .recv_timeout(TEST_WATCHDOG)
+                .expect("key wait did not wake after raise_to"),
+            Ok((5, number_id))
+        );
+        assert_eq!(
+            number_receiver
+                .recv_timeout(TEST_WATCHDOG)
+                .expect("number wait did not wake after raise_to"),
+            Ok(5)
+        );
+        key_waiter.join().unwrap();
+        number_waiter.join().unwrap();
     }
 
     #[test]
@@ -633,6 +721,64 @@ mod tests {
         track.leave(number_id).unwrap();
 
         assert_eq!(waiter.join().unwrap(), Err(WaitError::NotFound));
+    }
+
+    #[test]
+    fn concurrent_leave_wakes_a_blocking_number_wait() {
+        let track = AtomicTrackWaiting::new(1);
+        let number_id = track.enter(11).unwrap();
+        let waiter_track = track.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter_barrier = Arc::clone(&barrier);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let waiter = thread::spawn(move || {
+            let number = waiter_track.number(number_id).unwrap();
+            waiter_barrier.wait();
+            sender.send(number.wait_gte(1)).unwrap();
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        track.leave_concurrent(number_id).unwrap();
+
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_WATCHDOG)
+                .expect("number wait did not wake after leave_concurrent"),
+            Err(WaitError::NotFound)
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn manual_atomic_update_wakes_after_signal_change() {
+        let track = AtomicTrackWaiting::new(1);
+        let number_id = track.enter(15).unwrap();
+        let waiter_track = track.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter_barrier = Arc::clone(&barrier);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let waiter = thread::spawn(move || {
+            let number = waiter_track.number(number_id).unwrap();
+            waiter_barrier.wait();
+            sender.send(number.wait_gte(8)).unwrap();
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        let number = track.number(number_id).unwrap();
+        unsafe {
+            number.atomic().store(8, Ordering::Release);
+        }
+        number.signal_change();
+
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_WATCHDOG)
+                .expect("number wait did not wake after signal_change"),
+            Ok(8)
+        );
+        waiter.join().unwrap();
     }
 
     #[test]
