@@ -20,6 +20,10 @@
     all(target_family = "wasm", target_feature = "atomics"),
     feature(stdarch_wasm_atomic_wait)
 )]
+#![cfg_attr(
+    all(target_arch = "wasm64", target_feature = "atomics"),
+    feature(simd_wasm64)
+)]
 
 extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
@@ -39,7 +43,7 @@ use cache_padded::CachePadded;
 
 #[cfg(any(
     target_os = "windows",
-    target_os = "linux",
+    all(target_os = "linux", not(target_family = "wasm")),
     target_os = "macos",
     target_os = "freebsd",
     all(target_family = "wasm", target_feature = "atomics")
@@ -53,8 +57,31 @@ use crate::math::{gte_msb_masked, max2_msb_masked, max3_msb_masked, min2_msb_mas
 const EMPTY_ID: NumericType = 0;
 const KEY_LOCK_BIT: NumericType = SUSPENDED_BIT;
 
-#[cfg(feature = "waiting")]
+#[cfg(all(
+    feature = "waiting",
+    any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_family = "wasm")),
+        target_os = "macos",
+        target_os = "freebsd",
+        all(target_family = "wasm", target_feature = "atomics")
+    )
+))]
 pub mod waiting;
+
+#[cfg(all(
+    feature = "waiting",
+    not(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_family = "wasm")),
+        target_os = "macos",
+        target_os = "freebsd",
+        all(target_family = "wasm", target_feature = "atomics")
+    ))
+))]
+compile_error!(
+    "the `waiting` module supports Windows, Linux, macOS, FreeBSD, and Wasm with the atomics target feature"
+);
 
 /// Get only the key bits from a number, meaning everything other than the MSB.
 #[inline]

@@ -141,7 +141,7 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_family = "wasm")))]
 mod imp {
     use super::AtomicU32;
     use core::{ffi::c_void, ptr};
@@ -396,7 +396,7 @@ mod imp {
 
 #[cfg(not(any(
     target_os = "windows",
-    target_os = "linux",
+    all(target_os = "linux", not(target_family = "wasm")),
     target_os = "macos",
     target_os = "freebsd",
     all(target_family = "wasm", target_feature = "atomics")
