@@ -18,4 +18,7 @@ waiting = []  # marker feature for enabling the waiting module (std will be link
 smaller-atomics = []  # marker feature for using 32-bit atomics
 no-cache-pad = []  # marker feature for not padding to cache line: can reduce performance based on use-case but saves memory
 
+[package.metadata.docs.rs]
+features = ["waiting"]
+
 [dependencies]
