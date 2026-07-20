@@ -1,6 +1,6 @@
 [package]
 name = "atomictrack"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Shiko Kudo <bluesky42624@gmail.com>"]
 description = "A place to play with monotonic atomic numbers"
