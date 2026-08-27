@@ -10,40 +10,20 @@
 
 //TODO: raise_to, add, and both leave methods notify even on errors or no-op updates. With wake_all and a shared futex pool, this can create wake storms. Change eventually if that becomes a problem.
 
+#[cfg(feature = "std")]
 extern crate std;
+
+#[cfg(feature = "std")]
 use std::time::Instant;
 
 use core::{hash::{Hash, Hasher}, ptr::NonNull, sync::atomic::{AtomicU32, Ordering}};
 
-use crate::{AtomicTrack, AtomicTrackInner, EMPTY_ID, EnterError, LeaveError, Number, NumberError, NumberId, futex, is_key_locked, is_suspended, math::{AtomicType, NumericType, gte_msb_masked}, without_suspended_bit};
-
-macro_rules! env_or_default {
-    ($env_name:expr, $default:expr, $ty:ty) => {{
-        const STR_VAL: &str = match option_env!($env_name) {
-            Some(s) => s,
-            None => $default,
-        };
-        
-        // Compile-time string-to-integer parsing
-        {
-            let bytes = STR_VAL.as_bytes();
-            let mut value: $ty = 0;
-            let mut i = 0;
-            while i < bytes.len() {
-                value = value * 10 + (bytes[i] - b'0') as $ty;
-                i += 1;
-            }
-            value
-        }
-    }};
-}
+use crate::{AtomicTrack, AtomicTrackInner, EMPTY_ID, EnterError, LeaveError, Number, NumberError, NumberId, env_or_default, futex, is_key_locked, is_suspended, math::{AtomicType, NumericType, gte_msb_masked}, spin_for_step, utils::{MAX_LOOPS_BEFORE_SLEEP, MAX_SPINS, yield_now}, without_suspended_bit};
 
 const NUM_FUTEXES: usize = env_or_default!("ATOMICTRACK_FUTEX_POOL_SIZE", "1024", usize);
 const _: () = {
     assert!(NUM_FUTEXES > 0, "FUTEX pool size must be something that isn't zero!");
 };
-
-const MAX_SPIN_LOOPS_BEFORE_SLEEP: usize = env_or_default!("ATOMICTRACK_MAX_SPIN_LOOPS_BEFORE_SLEEP", "10", usize);
 
 static FUTEXES: [AtomicU32; NUM_FUTEXES] = [const { AtomicU32::new(0) }; NUM_FUTEXES];
 
@@ -214,7 +194,7 @@ impl AtomicTrackWaiting {
         let mut futex_value_before = 0;
         let futex_getter = || get_futex(&self.inner.inner, id);
         loop {
-            if i >= MAX_SPIN_LOOPS_BEFORE_SLEEP {
+            if i >= MAX_LOOPS_BEFORE_SLEEP {
                 futex_value_before = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
@@ -226,8 +206,10 @@ impl AtomicTrackWaiting {
             i += 1;
 
             // If it's not, we do different things based on whether we've exhausted the number of spins we're willing to do.
-            if i <= MAX_SPIN_LOOPS_BEFORE_SLEEP { // <= instead of < since the futex_value_before load and the futex_value_after load sandwiches a single spin. This means that `i` will always be one ahead of what futex_value_before sees, so we need to not go into the sleep path for one more iteration since futex_value_before is not ready.
-                core::hint::spin_loop();
+            if i < MAX_SPINS {
+                spin_for_step!(i);
+            } else if i <= MAX_LOOPS_BEFORE_SLEEP { // <= instead of < since the futex_value_before load and the futex_value_after load sandwiches a single spin. This means that `i` will always be one ahead of what futex_value_before sees, so we need to not go into the sleep path for one more iteration since futex_value_before is not ready.
+                yield_now();
             } else {
                 // Load the futex value again.
                 let futex_value_after = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire);
@@ -275,7 +257,7 @@ impl AtomicTrackWaiting {
         loop {
             let mut value = None;
 
-            if i >= MAX_SPIN_LOOPS_BEFORE_SLEEP {
+            if i >= MAX_LOOPS_BEFORE_SLEEP {
                 futex_value_before = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
@@ -320,8 +302,10 @@ impl AtomicTrackWaiting {
             i += 1;
 
             // If it's not, we do different things based on whether we've exhausted the number of spins we're willing to do.
-            if i <= MAX_SPIN_LOOPS_BEFORE_SLEEP { // <= instead of < since the futex_value_before load and the futex_value_after load sandwiches a single spin. This means that `i` will always be one ahead of what futex_value_before sees, so we need to not go into the sleep path for one more iteration since futex_value_before is not ready.
-                core::hint::spin_loop();
+            if i < MAX_SPINS {
+                spin_for_step!(i);
+            } else if i <= MAX_LOOPS_BEFORE_SLEEP { // <= instead of < since the futex_value_before load and the futex_value_after load sandwiches a single spin. This means that `i` will always be one ahead of what futex_value_before sees, so we need to not go into the sleep path for one more iteration since futex_value_before is not ready.
+                yield_now();
             } else {
                 // Load the futex value again.
                 let futex_value_after = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire);
@@ -429,7 +413,7 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
         loop {
             let mut value;
 
-            if i >= MAX_SPIN_LOOPS_BEFORE_SLEEP {
+            if i >= MAX_LOOPS_BEFORE_SLEEP {
                 futex_value_before = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
@@ -461,8 +445,10 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
             i += 1;
 
             // If it's not, we do different things based on whether we've exhausted the number of spins we're willing to do.
-            if i <= MAX_SPIN_LOOPS_BEFORE_SLEEP { // <= instead of < since the futex_value_before load and the futex_value_after load sandwiches a single spin. This means that `i` will always be one ahead of what futex_value_before sees, so we need to not go into the sleep path for one more iteration since futex_value_before is not ready.
-                core::hint::spin_loop();
+            if i < MAX_SPINS {
+                spin_for_step!(i);
+            } else if i <= MAX_LOOPS_BEFORE_SLEEP { // <= instead of < since the futex_value_before load and the futex_value_after load sandwiches a single spin. This means that `i` will always be one ahead of what futex_value_before sees, so we need to not go into the sleep path for one more iteration since futex_value_before is not ready.
+                yield_now();
             } else {
                 // Load the futex value again.
                 let futex_value_after = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire);

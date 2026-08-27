@@ -38,6 +38,8 @@ use math::{AtomicType, NumericType, MSB};
 
 const MAX_PUBLIC: NumericType = MSB - 1;
 
+pub mod utils;
+
 pub mod cache_padded;
 use cache_padded::CachePadded;
 

@@ -14,7 +14,8 @@ categories = ["algorithms", "concurrency", "data-structures"]
 
 [features]
 default = []
-waiting = []  # marker feature for enabling the waiting module (std will be linked)
+std = []
+waiting = ["std"]  # marker feature for enabling the waiting module (std will be linked)
 smaller-atomics = []  # marker feature for using 32-bit atomics
 no-cache-pad = []  # marker feature for not padding to cache line: can reduce performance based on use-case but saves memory
 
