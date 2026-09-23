@@ -18,6 +18,7 @@ std = []
 waiting = ["std"]  # marker feature for enabling the waiting module (std will be linked)
 smaller-atomics = []  # marker feature for using 32-bit atomics
 no-cache-pad = []  # marker feature for not padding to cache line: can reduce performance based on use-case but saves memory
+capi = []  # marker feature for whether to export A_T_* public C ABI exports
 
 [package.metadata.docs.rs]
 features = ["waiting"]

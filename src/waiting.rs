@@ -16,31 +16,134 @@ extern crate std;
 #[cfg(feature = "std")]
 use std::time::Instant;
 
-use core::{hash::{Hash, Hasher}, ptr::NonNull, sync::atomic::{AtomicU32, Ordering}};
+use core::{hash::{Hash, Hasher}, ptr::NonNull, sync::atomic::{AtomicPtr, AtomicU32, Ordering}};
+
+#[cfg(feature = "std")]
+use alloc::boxed::Box;
 
 use crate::{AtomicTrack, AtomicTrackInner, EMPTY_ID, EnterError, LeaveError, Number, NumberError, NumberId, env_or_default, futex, is_key_locked, is_suspended, math::{AtomicType, NumericType, gte_msb_masked}, spin_for_step, utils::{MAX_LOOPS_BEFORE_SLEEP, MAX_SPINS, yield_now}, without_suspended_bit};
 
-const NUM_FUTEXES: usize = env_or_default!("ATOMICTRACK_FUTEX_POOL_SIZE", "1024", usize);
+const DEFAULT_NUM_FUTEXES: usize = env_or_default!("ATOMICTRACK_FUTEX_POOL_SIZE", "1024", usize);
 const _: () = {
-    assert!(NUM_FUTEXES > 0, "FUTEX pool size must be something that isn't zero!");
+    assert!(DEFAULT_NUM_FUTEXES > 0, "FUTEX pool size must be something that isn't zero!");
+    assert!(DEFAULT_NUM_FUTEXES.is_power_of_two(), "FUTEX pool size must be power of two!");
 };
 
-static FUTEXES: [AtomicU32; NUM_FUTEXES] = [const { AtomicU32::new(0) }; NUM_FUTEXES];
-
-#[cfg(target_pointer_width = "64")]
-fn get_futex(a: &NonNull<AtomicTrackInner>, b: NumericType) -> &'static AtomicU32 {
-    let mut hasher = hasher::RhmHasher::default();
-    (a.as_ptr() as *const i64 as usize).hash(&mut hasher);
-    b.hash(&mut hasher);
-    &FUTEXES[hasher.finish() as usize % NUM_FUTEXES]
+#[repr(transparent)]
+struct ListofAtomicsWrapper {
+    s: &'static [AtomicU32],
 }
 
-#[cfg(target_pointer_width = "32")]
+static FUTEXES: AtomicPtr<ListofAtomicsWrapper> = AtomicPtr::new(
+    &ListofAtomicsWrapper { s: &[] } as *const _ as *mut _
+);
+
+static FUTEX_POOL_FREE_INIT: AtomicU32 = AtomicU32::new(1);
+
+fn prev_power_of_two(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        1 << (usize::BITS - 1 - n.leading_zeros())
+    }
+}
+
+/// Sets the waiting pool (a simple array of atomic u32s).
+///
+/// Returns 0 for success, 1 for when the pool was set by someone else instead (you can retry), -1 for invalid arguments.
+///
+/// Please call *before* you start waiting, or the default initializer when the length is zero will kick in.
+///
+/// **Important: `len` is rounded down to the previous power of two.**
+///
+/// # Safety
+/// `ptr` must point to a valid length of accessible memory holding aligned 32-bit
+/// values that remain valid until this library is unloaded, and that everyone also only ever
+/// accesses through atomic operations.
+/// **Also, if you have existing waits not set on a timeout, this might strand them forever.**
+#[allow(non_snake_case)]
+#[cfg(feature = "std")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
+pub unsafe extern "C" fn A_T_set_waiting_pool(ptr: *const AtomicU32, mut len: usize) -> i32 {
+    len = prev_power_of_two(len);
+    if len == 0 {
+        return -1;
+    }
+    if ptr.is_null()
+        || !ptr.is_aligned()
+        || len > isize::MAX as usize / size_of::<AtomicU32>()
+    {
+        return -1;
+    }
+    let slice: &'static [AtomicU32] = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let wrapper = Box::new(ListofAtomicsWrapper { s: slice });
+    let base = FUTEX_POOL_FREE_INIT.load(Ordering::Acquire);
+    if base % 2 == 1 {
+        // settled state, can change.
+        while FUTEX_POOL_FREE_INIT.load(Ordering::Acquire) == base {
+            if let Ok(_) = FUTEX_POOL_FREE_INIT.compare_exchange_weak(base, base.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed) {
+                FUTEXES.store(Box::leak(wrapper), Ordering::Release);
+                FUTEX_POOL_FREE_INIT.store(base.wrapping_add(2), Ordering::Release);
+                return 0;
+            }
+        }
+    }
+    1
+}
+
+#[inline]
+fn futexes() -> &'static [AtomicU32] {
+    let futexes = unsafe { (*FUTEXES.load(Ordering::Acquire)).s };
+    if !futexes.is_empty() {
+        return futexes;
+    }
+    futexes_slow()
+}
+
+#[cold]
+#[inline(never)]
+fn futexes_slow() -> &'static [AtomicU32] {
+    let s = unsafe {
+        Box::<[AtomicU32]>::new_zeroed_slice(DEFAULT_NUM_FUTEXES).assume_init()
+    };
+    let mut wrapper = Box::new(
+        ListofAtomicsWrapper { s: &[] },
+    );
+    let mut base = FUTEX_POOL_FREE_INIT.load(Ordering::Acquire);
+    let mut futexes = unsafe { (*FUTEXES.load(Ordering::Acquire)).s };
+    'outer: while futexes.is_empty() {
+        if base % 2 == 0 {
+            while FUTEX_POOL_FREE_INIT.load(Ordering::Acquire) % 2 == 0 {
+                yield_now();
+            }
+        } else {
+            // settled state, can change.
+            while FUTEX_POOL_FREE_INIT.load(Ordering::Acquire) == base {
+                if let Ok(_) = FUTEX_POOL_FREE_INIT.compare_exchange_weak(base, base.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed) {
+                    wrapper.s = Box::leak(s);
+                    FUTEXES.store(Box::leak(wrapper), Ordering::Release);
+                    FUTEX_POOL_FREE_INIT.store(base.wrapping_add(2), Ordering::Release);
+                    futexes = unsafe { (*FUTEXES.load(Ordering::Acquire)).s };
+                    break 'outer;
+                }
+            }
+        }
+        base = FUTEX_POOL_FREE_INIT.load(Ordering::Acquire);
+        futexes = unsafe { (*FUTEXES.load(Ordering::Acquire)).s };
+    }
+    futexes
+}
+
+fn futex(i: usize) -> &'static AtomicU32 {
+    let futexes = futexes();
+    &futexes[i & (futexes.len() - 1)]
+}
+
 fn get_futex(a: &NonNull<AtomicTrackInner>, b: NumericType) -> &'static AtomicU32 {
     let mut hasher = hasher::RhmHasher::default();
-    (a.as_ptr() as *const i32 as usize).hash(&mut hasher);
+    a.as_ptr().addr().hash(&mut hasher);
     b.hash(&mut hasher);
-    &FUTEXES[hasher.finish() as usize % NUM_FUTEXES]
+    futex(hasher.finish() as usize)
 }
 
 pub struct AtomicTrackWaiting {
