@@ -16,12 +16,12 @@ extern crate std;
 #[cfg(feature = "std")]
 use std::time::Instant;
 
-use core::{hash::{Hash, Hasher}, ptr::NonNull, sync::atomic::{AtomicPtr, AtomicU32, Ordering}};
+use core::{alloc::Layout, hash::{Hash, Hasher}, ptr::{self, NonNull}, sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering}};
 
 #[cfg(feature = "std")]
-use alloc::boxed::Box;
+use std::boxed::Box;
 
-use crate::{AtomicTrack, AtomicTrackInner, EMPTY_ID, EnterError, LeaveError, Number, NumberError, NumberId, env_or_default, futex, is_key_locked, is_suspended, math::{AtomicType, NumericType, gte_msb_masked}, spin_for_step, utils::{MAX_LOOPS_BEFORE_SLEEP, MAX_SPINS, yield_now}, without_suspended_bit};
+use crate::{AtomicTrack, EMPTY_ID, Slot, cache_padded::CachePadded, EnterError, LeaveError, Number, NumberError, NumberId, env_or_default, futex, is_key_locked, is_suspended, math::{AtomicType, NumericType, gte_msb_masked}, spin_for_step, utils::{MAX_LOOPS_BEFORE_SLEEP, MAX_SPINS, yield_now}, without_suspended_bit};
 
 const DEFAULT_NUM_FUTEXES: usize = env_or_default!("ATOMICTRACK_FUTEX_POOL_SIZE", "1024", usize);
 const _: () = {
@@ -139,16 +139,38 @@ fn futex(i: usize) -> &'static AtomicU32 {
     &futexes[i & (futexes.len() - 1)]
 }
 
-fn get_futex(a: &NonNull<AtomicTrackInner>, b: NumericType) -> &'static AtomicU32 {
+fn get_futex(a: &AtomicTrack, b: NumericType) -> &'static AtomicU32 {
     let mut hasher = hasher::RhmHasher::default();
-    a.as_ptr().addr().hash(&mut hasher);
+    (a as *const AtomicTrack).addr().hash(&mut hasher);
     b.hash(&mut hasher);
     futex(hasher.finish() as usize)
 }
 
-pub struct AtomicTrackWaiting {
-    inner: AtomicTrack,
+#[repr(C)]
+struct Shared<S: ?Sized = [CachePadded<Slot>]> {
+    handle_count: AtomicUsize,
+    track: AtomicTrack<S>,
 }
+
+fn shared_layout(capacity: usize) -> Layout {
+    assert!(
+        capacity.is_power_of_two(),
+        "capacity must be a power of two"
+    );
+    let track = AtomicTrack::layout(capacity)
+        .expect("capacity is too large");
+    let (layout, _) = Layout::new::<AtomicUsize>()
+        .extend(track)
+        .expect("capacity is too large");
+    layout.pad_to_align()
+}
+
+pub struct AtomicTrackWaiting {
+    shared: NonNull<Shared>,
+}
+
+unsafe impl Send for AtomicTrackWaiting {}
+unsafe impl Sync for AtomicTrackWaiting {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitError {
@@ -163,36 +185,66 @@ pub struct NumberWaiting<'a, 'b> {
 
 impl Clone for AtomicTrackWaiting {
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
+        self.shared().handle_count.fetch_add(1, Ordering::Relaxed);
+        Self { shared: self.shared }
+    }
+}
+
+impl Drop for AtomicTrackWaiting {
+    fn drop(&mut self) {
+        if self.shared().handle_count.fetch_sub(1, Ordering::Release) == 1 {
+            core::sync::atomic::fence(Ordering::Acquire);
+            let layout = shared_layout(self.track().capacity());
+            unsafe { std::alloc::dealloc(self.shared.as_ptr().cast::<u8>(), layout) };
+        }
     }
 }
 
 impl AtomicTrackWaiting {
     pub fn new(capacity: usize) -> Self {
-        Self { inner: AtomicTrack::new(capacity) }
+        let layout = shared_layout(capacity);
+        unsafe {
+            let Some(ptr) = NonNull::new(std::alloc::alloc(layout)) else {
+                std::alloc::handle_alloc_error(layout);
+            };
+            let shared = ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast::<CachePadded<Slot>>(), capacity) as *mut Shared;
+            (&raw mut (*shared).handle_count).write(AtomicUsize::new(1));
+            AtomicTrack::init_in_place(NonNull::new_unchecked((&raw mut (*shared).track).cast::<u8>()), capacity);
+            Self { shared: NonNull::new_unchecked(shared) }
+        }
+    }
+
+    #[inline]
+    fn shared(&self) -> &Shared {
+        unsafe { self.shared.as_ref() }
+    }
+
+    #[inline]
+    fn track(&self) -> &AtomicTrack {
+        &self.shared().track
     }
 
     pub fn capacity(&self) -> usize {
-        self.inner.capacity()
+        self.track().capacity()
     }
 
     /// [`find_min`](`AtomicTrackWaiting::find_min`) updates the current global min, this one just reads it.
     pub fn min(&self) -> NumericType {
-        self.inner.min()
+        self.track().min()
     }
 
     pub fn find_min(&self) -> NumericType {
-        self.inner.find_min()
+        self.track().find_min()
     }
 
     pub fn enter(&self, id: NumericType) -> Result<NumberId, EnterError> {
-        self.enter_from(id, self.inner.min())
+        self.enter_from(id, self.track().min())
     }
 
     pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
-        match self.inner.enter_from(id, at_least) {
+        match self.track().enter_from(id, at_least) {
             Ok(number_id) => {
-                let f = get_futex(&self.inner.inner, number_id.id);
+                let f = get_futex(self.track(), number_id.id);
                 f.fetch_add(1, Ordering::Release);
                 let _ = futex::wake_all(f);
                 Ok(number_id)
@@ -203,7 +255,7 @@ impl AtomicTrackWaiting {
 
     /// Recover a [`NumberId`] from a key. This is usually fast but since it *can* scan the whole ring, keeping the [`NumberId`] directly is better.
     pub fn recover(&self, id: NumericType) -> Option<NumberId> {
-        self.inner.recover(id)
+        self.track().recover(id)
     }
 
     /// Just like [`recover`](`AtomicTrackWaiting::recover`), this is usually fast but since it *can* scan the whole ring, using [`with_number`](`AtomicTrackWaiting::with_number`) is better if you can.
@@ -212,7 +264,7 @@ impl AtomicTrackWaiting {
         id: NumericType,
         f: impl FnOnce(NumberWaiting<'_, '_>) -> R,
     ) -> Result<R, NumberError> {
-        self.inner.with_id(id, |number| {
+        self.track().with_id(id, |number| {
             f(NumberWaiting {
                 inner: number,
                 atomic_track_waiting: self,
@@ -225,7 +277,7 @@ impl AtomicTrackWaiting {
         number: NumberId,
         f: impl FnOnce(NumberWaiting<'_, '_>) -> R,
     ) -> Result<R, NumberError> {
-        self.inner.with_number(number, |number| {
+        self.track().with_number(number, |number| {
             f(NumberWaiting {
                 inner: number,
                 atomic_track_waiting: self,
@@ -234,7 +286,7 @@ impl AtomicTrackWaiting {
     }
 
     pub fn number(&self, number: NumberId) -> Result<NumberWaiting<'_, '_>, NumberError> {
-        self.inner.number(number).map(|number| NumberWaiting {
+        self.track().number(number).map(|number| NumberWaiting {
             inner: number,
             atomic_track_waiting: self,
         })
@@ -295,14 +347,14 @@ impl AtomicTrackWaiting {
         let mut i = 0;
         let mut f = None;
         let mut futex_value_before = 0;
-        let futex_getter = || get_futex(&self.inner.inner, id);
+        let futex_getter = || get_futex(self.track(), id);
         loop {
             if i >= MAX_LOOPS_BEFORE_SLEEP {
                 futex_value_before = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
             //NOTE: `recover` returns None and stops probing if it finds a slot with the right key but that is still locked, but this is fine because if it's locked it should soon be unlocked, at which point the thread that finished adding in the id to the slot will wake this thread up again, and it will recheck, and recover will then find it this time, so given the contract of finding whatever was the first to be found in the ring with the provided id, this is good.
-            if let Some(number_id) = self.inner.recover(id) {
+            if let Some(number_id) = self.track().recover(id) {
                 return Ok(number_id);
             }
 
@@ -355,7 +407,7 @@ impl AtomicTrackWaiting {
         let mut i = 0;
         let mut f = None;
         let mut futex_value_before = 0;
-        let futex_getter = || get_futex(&self.inner.inner, id);
+        let futex_getter = || get_futex(self.track(), id);
         let mut number = None;
         loop {
             let mut value = None;
@@ -365,7 +417,7 @@ impl AtomicTrackWaiting {
             }
 
             if number.is_none() {
-                if let Some(number_id) = self.inner.recover(id) {
+                if let Some(number_id) = self.track().recover(id) {
                     //NOTE: This should never error since number_ids returned by recover should be valid (the input id itself has to be valid, which was checked earlier). "self.number" only indexes into the ring with the id and offset pair, it doesn't check whether that slot is actually occupied by the id specified in the number_id.
                     number = self.number(number_id).ok().map(|number_waiting| (number_waiting, number_id));
                 }
@@ -457,16 +509,16 @@ impl AtomicTrackWaiting {
     }
 
     pub fn leave(&self, number: NumberId) -> Result<(), LeaveError> {
-        let result = self.inner.leave(number);
-        let f = get_futex(&self.inner.inner, number.id);
+        let result = self.track().leave(number);
+        let f = get_futex(self.track(), number.id);
         f.fetch_add(1, Ordering::Release);
         let _ = futex::wake_all(f);
         result
     }
 
     pub fn leave_concurrent(&self, number: NumberId) -> Result<(), LeaveError> {
-        let result = self.inner.leave_concurrent(number);
-        let f = get_futex(&self.inner.inner, number.id);
+        let result = self.track().leave_concurrent(number);
+        let f = get_futex(self.track(), number.id);
         f.fetch_add(1, Ordering::Release);
         let _ = futex::wake_all(f);
         result
@@ -491,7 +543,7 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
     }
 
     pub fn signal_change(&self) {
-        let f = get_futex(&self.atomic_track_waiting.inner.inner, self.inner.id);
+        let f = get_futex(self.atomic_track_waiting.track(), self.inner.id);
         f.fetch_add(1, Ordering::Release);
         let _ = futex::wake_all(f);
     }
@@ -512,7 +564,7 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
         let mut i = 0;
         let mut f = None;
         let mut futex_value_before = 0;
-        let futex_getter = || get_futex(&self.atomic_track_waiting.inner.inner, self.inner.id);
+        let futex_getter = || get_futex(self.atomic_track_waiting.track(), self.inner.id);
         loop {
             let mut value;
 
@@ -649,7 +701,7 @@ mod tests {
     #[test]
     fn recover_ignores_an_entry_that_is_still_locked() {
         let track = AtomicTrackWaiting::new(1);
-        let inner = unsafe { track.inner.inner.as_ref() };
+        let inner = track.track();
         let slot = &inner.slots[0];
 
         slot.id.store(lock_key(7), Ordering::Release);
@@ -895,7 +947,7 @@ mod tests {
         let number_id = track.enter(1).unwrap();
 
         let (result, elapsed) = run_while_futex_is_hot(
-            get_futex(&track.inner.inner, 2),
+            get_futex(track.track(), 2),
             || track.wait_for_timeout(2, TIMEOUT_NS),
         );
         assert_eq!(result, Err(WaitError::NotFound));
@@ -903,7 +955,7 @@ mod tests {
         assert!(elapsed < MAX_ALLOWED, "entry wait took {elapsed:?}");
 
         let (result, elapsed) = run_while_futex_is_hot(
-            get_futex(&track.inner.inner, number_id.id),
+            get_futex(track.track(), number_id.id),
             || track.wait_gte_timeout(number_id.id, 1, TIMEOUT_NS),
         );
         assert_eq!(result, Ok((false, 0, number_id)));
@@ -912,7 +964,7 @@ mod tests {
 
         let number = track.number(number_id).unwrap();
         let (result, elapsed) = run_while_futex_is_hot(
-            get_futex(&track.inner.inner, number_id.id),
+            get_futex(track.track(), number_id.id),
             || number.wait_gte_timeout(1, TIMEOUT_NS),
         );
         assert_eq!(result, Ok((false, 0)));
@@ -971,11 +1023,6 @@ mod hasher {
     // MIT license. Its source is available at https://github.com/Nicoshev/rapidhash.
 
     //! Rustlang port of rapidhashMicro V3, Nicolas De Carli's hashing algorithm based upon wyhash by Wang Yi.
-
-    extern crate alloc;
-
-    #[allow(unused_imports)]
-    use alloc::vec::Vec;
 
     use core::hash::Hasher;
 
@@ -1173,7 +1220,10 @@ mod hasher {
 
     #[cfg(test)]
     mod tests {
+        extern crate std;
+
         use super::*;
+        use std::vec::Vec;
 
         #[test]
         fn rapidhash_micro_matches_v3_reference_vectors() {

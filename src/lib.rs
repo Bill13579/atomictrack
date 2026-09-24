@@ -12,7 +12,7 @@
 //! - Greater than and less than comparisons use wrapping-aware versions internally, so you might be surprised at some of the behavior when seeing edge cases. For example, on a fresh track, `enter_from(id, MSB / 2)` will initialize the lane to 0, because the halfway point on the ring has no unambiguous ordering relative to zero. If you keep to the rule that all numbers remain within the circular range mentioned above though, you probably won't notice most of the time.
 //! - Keys are not guaranteed to be unique; rather, it's loosely unique in the sense that it will tell you if it finds during the probe when inserting that there is a slot with that key already (*if* it finds it, it might not) or with [`AtomicTrack::recover`] and [`AtomicTrack::with_id`], returning the first matching lane with no promises that the result is unique. The [`NumberId`] should be considered the actual unique key.
 //! - Unless there's a `_concurrent` version of a function present, otherwise all functions can be assumed thread-safe.
-//! - [`AtomicTrack`] is `Send` and `Sync` and you can [`Clone`] it because it has an internal atomic reference count.
+//! - [`AtomicTrack`] is `Send` and `Sync`.
 //! - ...That's basically it for now.
 
 #![no_std]
@@ -25,14 +25,10 @@
     feature(simd_wasm64)
 )]
 
-extern crate alloc;
-use alloc::{boxed::Box, vec::Vec};
+use core::{alloc::Layout, ops::Deref, ptr::{self, NonNull}};
 
-use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-// AtomicUsize for manual atomic reference counting and AtomicType for everything else.
 pub mod math;
 use math::{AtomicType, NumericType, MSB};
 
@@ -127,28 +123,31 @@ const fn is_valid_public_value(value: NumericType) -> bool {
     value <= MAX_PUBLIC
 }
 
-pub struct AtomicTrack {
-    inner: NonNull<AtomicTrackInner>,
-}
-
-pub struct AtomicTrackInner {
-    handle_count: CachePadded<AtomicUsize>,
+#[repr(C)]
+pub struct AtomicTrack<S: ?Sized = [CachePadded<Slot>]> {
     min: CachePadded<AtomicType>,
-    mask: usize,
-    slots: Box<[CachePadded<Slot>]>,
+    slots: S,
 }
 
-struct Slot {
+pub type ArrayAtomicTrack<const N: usize> = AtomicTrack<[CachePadded<Slot>; N]>;
+
+pub struct Slot {
     id: AtomicType,
     value: AtomicType,
 }
 
 impl Slot {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             id: AtomicType::new(EMPTY_ID),
             value: AtomicType::new(with_suspended_bit(0)),
         }
+    }
+}
+
+impl Default for Slot {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -184,82 +183,103 @@ pub struct Number<'a> {
     id: NumericType,
 }
 
-unsafe impl Send for AtomicTrack {}
-unsafe impl Sync for AtomicTrack {}
+const _: () = {
+    const fn assert_send_sync<T: ?Sized + Send + Sync>() {}
+    assert_send_sync::<AtomicTrack>();
+};
 
-impl Clone for AtomicTrack {
-    fn clone(&self) -> Self {
-        unsafe {
-            self.inner
-                .as_ref()
-                .handle_count
-                .fetch_add(1, Ordering::Relaxed);
+impl<const N: usize> ArrayAtomicTrack<N> {
+    pub const fn new() -> Self {
+        const { assert!(N.is_power_of_two(), "capacity must be a power of two") };
+        Self {
+            min: CachePadded::new(AtomicType::new(0)),
+            slots: [const { CachePadded::new(Slot::new()) }; N],
         }
-        Self { inner: self.inner }
     }
 }
 
-impl Drop for AtomicTrack {
-    fn drop(&mut self) {
-        unsafe {
-            let inner = self.inner.as_ref();
-            if inner.handle_count.fetch_sub(1, Ordering::Release) == 1 {
-                core::sync::atomic::fence(Ordering::Acquire);
-                drop(Box::from_raw(self.inner.as_ptr()));
-            }
-        }
+impl<const N: usize> Default for ArrayAtomicTrack<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> Deref for ArrayAtomicTrack<N> {
+    type Target = AtomicTrack;
+
+    fn deref(&self) -> &AtomicTrack {
+        self
     }
 }
 
 impl AtomicTrack {
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "capacity must be > 0");
+    pub fn layout(capacity: usize) -> Option<Layout> {
+        if !capacity.is_power_of_two() {
+            return None;
+        }
+        let slots = Layout::array::<CachePadded<Slot>>(capacity).ok()?;
+        let (layout, _) = Layout::new::<CachePadded<AtomicType>>().extend(slots).ok()?;
+        Some(layout.pad_to_align())
+    }
+
+    /// # Safety
+    /// `ptr` must be valid for writes, and with layout [`layout(capacity)`](`AtomicTrack::layout`). It must be aligned. It must stay valid for lifetime `'a`.
+    pub unsafe fn init_in_place<'a>(ptr: NonNull<u8>, capacity: usize) -> &'a Self {
         assert!(
             capacity.is_power_of_two(),
             "capacity must be a power of two"
         );
+        assert!(
+            Self::layout(capacity).is_some(),
+            "capacity is too large"
+        );
+        let track = ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast::<CachePadded<Slot>>(), capacity) as *mut Self;
+        unsafe {
+            (&raw mut (*track).min).write(CachePadded::new(AtomicType::new(0)));
+            let slots = (&raw mut (*track).slots).cast::<CachePadded<Slot>>();
+            for i in 0..capacity {
+                slots.add(i).write(CachePadded::new(Slot::new()));
+            }
+            &*track
+        }
+    }
 
-        let slots = (0..capacity)
-            .map(|_| CachePadded::new(Slot::new()))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let inner = Box::new(AtomicTrackInner {
-            handle_count: CachePadded::new(AtomicUsize::new(1)),
-            min: CachePadded::new(AtomicType::new(0)),
-            mask: capacity - 1,
-            slots,
-        });
-
-        Self {
-            inner: NonNull::from(Box::leak(inner)),
+    /// # Safety
+    /// `ptr` must point to a track of exactly `capacity` number of slots that was initialized with [`init_in_place`](`AtomicTrack::init_in_place`) (or is otherwise laid out and initialized identically) and stays valid for `'a`.
+    pub unsafe fn from_raw<'a>(ptr: NonNull<u8>, capacity: usize) -> &'a Self {
+        assert!(
+            capacity.is_power_of_two(),
+            "capacity must be a power of two"
+        );
+        assert!(
+            Self::layout(capacity).is_some(),
+            "capacity is too large"
+        );
+        unsafe {
+            &*(ptr::slice_from_raw_parts(ptr.as_ptr().cast::<CachePadded<Slot>>(), capacity) as *const Self)
         }
     }
 
     pub fn capacity(&self) -> usize {
-        unsafe { self.inner.as_ref().slots.len() }
+        self.slots.len()
     }
 
     /// [`find_min`](`AtomicTrack::find_min`) updates the current global min, this one just reads it.
     pub fn min(&self) -> NumericType {
-        unsafe { self.inner.as_ref().min.load(Ordering::Acquire) }
-    }
-
-    pub fn find_min(&self) -> NumericType {
-        unsafe { self.inner.as_ref().find_min() }
+        self.min.load(Ordering::Acquire)
     }
 
     pub fn enter(&self, id: NumericType) -> Result<NumberId, EnterError> {
         self.enter_from(id, self.min())
     }
 
-    pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
-        unsafe { self.inner.as_ref().enter_from(id, at_least) }
-    }
-
     /// Recover a [`NumberId`] from a key. This is usually fast but since it *can* scan the whole ring, keeping the [`NumberId`] directly is better.
     pub fn recover(&self, id: NumericType) -> Option<NumberId> {
-        unsafe { self.inner.as_ref().recover(id) }
+        if let Some((number_id, false)) = self.__recover(id) {
+            Some(number_id)
+        } else {
+            None
+        }
     }
 
     /// Just like [`recover`](`AtomicTrack::recover`), this is usually fast but since it *can* scan the whole ring, using [`with_number`](`AtomicTrack::with_number`) is better if you can.
@@ -280,7 +300,7 @@ impl AtomicTrack {
     }
 
     pub fn number(&self, number: NumberId) -> Result<Number<'_>, NumberError> {
-        let slot = unsafe { self.inner.as_ref().get_slot_concurrent(number)? };
+        let slot = self.get_slot_concurrent(number)?;
         Ok(Number {
             slot,
             id: number.id,
@@ -288,16 +308,14 @@ impl AtomicTrack {
     }
 
     pub fn leave(&self, number: NumberId) -> Result<(), LeaveError> {
-        unsafe { self.inner.as_ref().__leave(number, false) }
+        self.__leave(number, false)
     }
 
     /// Use this if there's ever more than one thread that might be touching the same number concurrently. There aren't any performance penalties, but when this physical slot is reused later for a new entrant, they will have to enter at a value *at least* 1 greater than what was left behind (other conditions separate).
     pub fn leave_concurrent(&self, number: NumberId) -> Result<(), LeaveError> {
-        unsafe { self.inner.as_ref().__leave(number, true) }
+        self.__leave(number, true)
     }
-}
 
-impl AtomicTrackInner {
     fn __leave(&self, number: NumberId, __concurrent_write_leave: bool) -> Result<(), LeaveError> {
         let slot = match self.get_slot_concurrent(number) {
             Ok(slot) => slot,
@@ -347,7 +365,7 @@ impl AtomicTrackInner {
         }
     }
 
-    fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
+    pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(EnterError::InvalidId);
         }
@@ -358,7 +376,7 @@ impl AtomicTrackInner {
         let start_idx = self.index_for(id);
 
         for probe_offset in 0..self.slots.len() {
-            let idx = (start_idx + probe_offset) & self.mask;
+            let idx = (start_idx + probe_offset) & self.mask();
             let slot = &self.slots[idx];
             let current_id = slot.id.load(Ordering::Acquire);
 
@@ -406,14 +424,6 @@ impl AtomicTrackInner {
         Err(EnterError::Full)
     }
 
-    fn recover(&self, id: NumericType) -> Option<NumberId> {
-        if let Some((number_id, false)) = self.__recover(id) {
-            Some(number_id)
-        } else {
-            None
-        }
-    }
-
     fn __recover(&self, id: NumericType) -> Option<(NumberId, bool)> {
         if id == EMPTY_ID || is_key_locked(id) {
             return None;
@@ -421,7 +431,7 @@ impl AtomicTrackInner {
 
         let base_index = self.index_for(id);
         for probe_offset in 0..self.slots.len() {
-            let index = (base_index + probe_offset) & self.mask;
+            let index = (base_index + probe_offset) & self.mask();
             let slot = &self.slots[index];
             let current = slot.id.load(Ordering::Acquire);
             if key_bits(current) == id {
@@ -438,7 +448,7 @@ impl AtomicTrackInner {
         None
     }
 
-    fn find_min(&self) -> NumericType {
+    pub fn find_min(&self) -> NumericType {
         let mut active_max: Option<NumericType> = None;
 
         // Goes through all slots to find the maximum active number.
@@ -561,13 +571,18 @@ impl AtomicTrackInner {
     }
 
     #[inline]
+    fn mask(&self) -> usize {
+        self.slots.len() - 1
+    }
+
+    #[inline]
     fn index_for(&self, id: NumericType) -> usize {
-        (id as usize) & self.mask
+        (id as usize) & self.mask()
     }
 
     #[inline]
     fn index_for_offsetted(&self, id: NumericType, placement_offset: usize) -> usize {
-        (id as usize + placement_offset) & self.mask
+        (id as usize + placement_offset) & self.mask()
     }
 }
 
@@ -688,9 +703,89 @@ mod tests {
 
     use super::*;
 
+    static STATIC_TRACK: ArrayAtomicTrack<4> = ArrayAtomicTrack::new();
+
+    #[test]
+    fn static_track_is_usable() {
+        let track: &AtomicTrack = &STATIC_TRACK;
+        let number = track.enter(3).unwrap();
+        assert_eq!(track.number(number).unwrap().raise_to(6), Ok(6));
+        assert_eq!(track.find_min(), 6);
+        track.leave(number).unwrap();
+    }
+
+    #[test]
+    fn layout_matches_fixed_track() {
+        fn check<const N: usize>() {
+            let fixed = ArrayAtomicTrack::<N>::new();
+            let layout = AtomicTrack::layout(N).unwrap();
+            let unsized_track: &AtomicTrack = &fixed;
+            assert_eq!(size_of::<ArrayAtomicTrack<N>>(), layout.size());
+            assert_eq!(align_of::<ArrayAtomicTrack<N>>(), layout.align());
+            assert_eq!(core::mem::size_of_val(unsized_track), layout.size());
+            assert_eq!(core::mem::align_of_val(unsized_track), layout.align());
+            assert_eq!(unsized_track.capacity(), N);
+        }
+        check::<1>();
+        check::<2>();
+        check::<8>();
+        check::<64>();
+
+        assert_eq!(AtomicTrack::layout(0), None);
+        assert_eq!(AtomicTrack::layout(3), None);
+        assert_eq!(AtomicTrack::layout(usize::MAX / 2 + 1), None);
+    }
+
+    #[test]
+    fn init_in_place_and_from_raw_share_state() {
+        let layout = AtomicTrack::layout(4).unwrap();
+        unsafe {
+            let ptr = NonNull::new(std::alloc::alloc(layout)).unwrap();
+            let track = AtomicTrack::init_in_place(ptr, 4);
+            assert_eq!(track.capacity(), 4);
+            assert_eq!(track.min(), 0);
+
+            let number = track.enter(3).unwrap();
+            track.number(number).unwrap().raise_to(9).unwrap();
+
+            let cast = AtomicTrack::from_raw(ptr, 4);
+            assert_eq!(cast.capacity(), 4);
+            assert_eq!(cast.recover(3), Some(number));
+            assert_eq!(cast.with_id(3, |lane| lane.get()).unwrap(), Ok(9));
+            assert_eq!(cast.find_min(), 9);
+            assert_eq!(track.min(), 9);
+
+            std::alloc::dealloc(ptr.as_ptr(), layout);
+        }
+    }
+
+    #[test]
+    fn init_in_place_resets_dirty_memory() {
+        let layout = AtomicTrack::layout(2).unwrap();
+        unsafe {
+            let ptr = NonNull::new(std::alloc::alloc(layout)).unwrap();
+            ptr.as_ptr().write_bytes(0xAB, layout.size());
+            let track = AtomicTrack::init_in_place(ptr, 2);
+            assert_eq!(track.min(), 0);
+            assert_eq!(track.recover(1), None);
+            let number = track.enter(1).unwrap();
+            assert_eq!(track.number(number).unwrap().get(), Ok(0));
+            std::alloc::dealloc(ptr.as_ptr(), layout);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be a power of two")]
+    fn init_in_place_rejects_non_power_of_two() {
+        let mut buffer = ArrayAtomicTrack::<4>::new();
+        unsafe {
+            AtomicTrack::init_in_place(NonNull::from(&mut buffer).cast(), 3);
+        }
+    }
+
     #[test]
     fn enter_recover_and_use_number() {
-        let track = AtomicTrack::new(8);
+        let track = ArrayAtomicTrack::<8>::new();
 
         let number = track.enter(11).unwrap();
         assert_eq!(track.recover(11), Some(number));
@@ -708,14 +803,14 @@ mod tests {
 
     #[test]
     fn duplicate_ids_are_rejected() {
-        let track = AtomicTrack::new(4);
+        let track = ArrayAtomicTrack::<4>::new();
         assert!(track.enter(123).is_ok());
         assert_eq!(track.enter(123), Err(EnterError::AlreadyPresent));
     }
 
     #[test]
     fn same_id_can_identify_distinct_placements_after_a_hole() {
-        let track = AtomicTrack::new(4);
+        let track = ArrayAtomicTrack::<4>::new();
         let hole = track.enter(1).unwrap();
         let first = track.enter(5).unwrap();
 
@@ -742,13 +837,13 @@ mod tests {
 
     #[test]
     fn ids_with_reserved_bit_are_rejected() {
-        let track = AtomicTrack::new(4);
+        let track = ArrayAtomicTrack::<4>::new();
         assert_eq!(track.enter(SUSPENDED_BIT), Err(EnterError::InvalidId));
     }
 
     #[test]
     fn offset_is_probe_delta() {
-        let track = AtomicTrack::new(4);
+        let track = ArrayAtomicTrack::<4>::new();
         let first = track.enter(1).unwrap();
         let second = track.enter(5).unwrap();
 
@@ -760,7 +855,7 @@ mod tests {
 
     #[test]
     fn find_min_advances_global_min() {
-        let track = AtomicTrack::new(8);
+        let track = ArrayAtomicTrack::<8>::new();
         let a = track.enter(1).unwrap();
         let b = track.enter(2).unwrap();
 
@@ -781,7 +876,7 @@ mod tests {
 
     #[test]
     fn leave_and_reenter_reuse_lane_with_new_id() {
-        let track = AtomicTrack::new(2);
+        let track = ArrayAtomicTrack::<2>::new();
         let a = track.enter(10).unwrap();
         track
             .with_number(a, |lane| lane.raise_to(9).unwrap())
@@ -800,7 +895,7 @@ mod tests {
 
     #[test]
     fn suspended_lane_floor_survives_reentry_without_advancing_global_min() {
-        let track = AtomicTrack::new(1);
+        let track = ArrayAtomicTrack::<1>::new();
         let a = track.enter(1).unwrap();
 
         track
@@ -820,7 +915,7 @@ mod tests {
 
     #[test]
     fn leave_concurrent_bumps_reentry_floor() {
-        let track = AtomicTrack::new(1);
+        let track = ArrayAtomicTrack::<1>::new();
         let a = track.enter(1).unwrap();
 
         track
@@ -837,7 +932,7 @@ mod tests {
 
     #[test]
     fn find_min_and_concurrent_leave_progress_across_wrap() {
-        let track = AtomicTrack::new(1);
+        let track = ArrayAtomicTrack::<1>::new();
         let number = track.enter(1).unwrap();
         let quarter = NumericType::MAX / 4;
 
@@ -864,7 +959,7 @@ mod tests {
 
     #[test]
     fn raise_to_progresses_across_wrap() {
-        let track = AtomicTrack::new(1);
+        let track = ArrayAtomicTrack::<1>::new();
         let number = track.enter(1).unwrap();
         let quarter = NumericType::MAX / 4;
 
@@ -886,7 +981,7 @@ mod tests {
 
     #[test]
     fn leave_can_beat_an_in_flight_update() {
-        let track = Arc::new(AtomicTrack::new(4));
+        let track = Arc::new(ArrayAtomicTrack::<4>::new());
         let number = track.enter(77).unwrap();
         let barrier = Arc::new(Barrier::new(2));
 
