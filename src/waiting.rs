@@ -21,7 +21,7 @@ use core::{alloc::Layout, hash::{Hash, Hasher}, ptr::{self, NonNull}, sync::atom
 #[cfg(feature = "std")]
 use std::boxed::Box;
 
-use crate::{AtomicTrack, EMPTY_ID, Slot, cache_padded::CachePadded, EnterError, LeaveError, Number, NumberError, NumberId, env_or_default, futex, is_key_locked, is_suspended, math::{AtomicType, NumericType, gte_msb_masked}, spin_for_step, utils::{MAX_LOOPS_BEFORE_SLEEP, MAX_SPINS, yield_now}, without_suspended_bit};
+use crate::{AtomicTrack, EMPTY_ID, Slot, cache_padded::CachePadded, EnterError, LeaveError, Number, NumberError, NumberId, env_or_default, futex, is_key_locked, is_suspended, key_bits, math::{AtomicType, NumericType, gte_msb_masked}, spin_for_step, utils::{MAX_LOOPS_BEFORE_SLEEP, MAX_SPINS, yield_now}, without_suspended_bit};
 
 const DEFAULT_NUM_FUTEXES: usize = env_or_default!("ATOMICTRACK_FUTEX_POOL_SIZE", "1024", usize);
 const _: () = {
@@ -144,6 +144,19 @@ fn get_futex(a: &AtomicTrack, b: NumericType) -> &'static AtomicU32 {
     (a as *const AtomicTrack).addr().hash(&mut hasher);
     b.hash(&mut hasher);
     futex(hasher.finish() as usize)
+}
+
+/// For convenience, a stable hash that gives you an id from a string name.
+pub const fn id_of(name: &str) -> NumericType {
+    let bytes = name.as_bytes();
+    let mut state = 0;
+    loop {
+        state = hasher::rapidhash_micro_with_seed(bytes, state);
+        let id = key_bits(state as NumericType);
+        if id != EMPTY_ID {
+            return id;
+        }
+    }
 }
 
 #[repr(C)]
@@ -699,6 +712,74 @@ mod tests {
     }
 
     #[test]
+    fn id_of_output_is_pinned() {
+        #[cfg(not(feature = "smaller-atomics"))]
+        let expected = [
+            ("", 0x0338_dc4b_e2ce_cdae),
+            ("renderer", 0x1df5_c40b_81fb_24e4),
+            ("audio", 0x5969_afff_8526_d1e1),
+        ];
+        #[cfg(feature = "smaller-atomics")]
+        let expected = [
+            ("", 0x62ce_cdae),
+            ("renderer", 0x01fb_24e4),
+            ("audio", 0x0526_d1e1),
+        ];
+        for (name, id) in expected {
+            assert_eq!(id_of(name), id, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn id_of_is_const_and_yields_valid_distinct_ids() {
+        const RENDERER: NumericType = id_of("renderer");
+        assert_eq!(RENDERER, id_of("renderer"));
+
+        let long = "x".repeat(200);
+        let names = ["", "a", "b", "renderer", "audio", "sixteen byte key", "seventeen byte key", long.as_str()];
+        let ids = names.map(id_of);
+        for (name, id) in names.iter().zip(ids) {
+            assert_ne!(id, EMPTY_ID, "{name:?}");
+            assert!(!is_key_locked(id), "{name:?}");
+        }
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(ids[i], ids[j], "{:?} and {:?}", names[i], names[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn id_of_matches_writing_the_name_into_the_hasher() {
+        for name in ["renderer", "audio", ""] {
+            let mut hasher = hasher::RhmHasher::default();
+            hasher.write(name.as_bytes());
+            assert_eq!(id_of(name), key_bits(hasher.finish() as NumericType), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn id_of_names_the_same_number_for_entering_and_waiting() {
+        let track = AtomicTrackWaiting::new(8);
+        let waiter_track = track.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter_barrier = Arc::clone(&barrier);
+        let waiter = thread::spawn(move || {
+            waiter_barrier.wait();
+            waiter_track.wait_gte_timeout(id_of("renderer"), 3, TEST_TIMEOUT_NS)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        let number_id = track.enter(id_of("renderer")).unwrap();
+        track.number(number_id).unwrap().raise_to(3).unwrap();
+
+        assert_eq!(waiter.join().unwrap(), Ok((true, 3, number_id)));
+        assert_eq!(track.recover(id_of("renderer")), Some(number_id));
+        assert_eq!(track.recover(id_of("audio")), None);
+    }
+
+    #[test]
     fn recover_ignores_an_entry_that_is_still_locked() {
         let track = AtomicTrackWaiting::new(1);
         let inner = track.track();
@@ -1067,19 +1148,19 @@ mod hasher {
     ];
 
     #[inline(always)]
-    fn rapid_multiply(a: u64, b: u64) -> (u64, u64) {
+    const fn rapid_multiply(a: u64, b: u64) -> (u64, u64) {
         let product = (a as u128) * (b as u128);
         (product as u64, (product >> 64) as u64)
     }
 
     #[inline(always)]
-    fn rapid_mix(a: u64, b: u64) -> u64 {
+    const fn rapid_mix(a: u64, b: u64) -> u64 {
         let (low, high) = rapid_multiply(a, b);
         low ^ high
     }
 
     #[inline(always)]
-    fn rapid_read_64(bytes: &[u8], at: usize) -> u64 {
+    const fn rapid_read_64(bytes: &[u8], at: usize) -> u64 {
         u64::from_le_bytes([
             bytes[at],
             bytes[at + 1],
@@ -1093,13 +1174,13 @@ mod hasher {
     }
 
     #[inline(always)]
-    fn rapid_read_32(bytes: &[u8], at: usize) -> u64 {
+    const fn rapid_read_32(bytes: &[u8], at: usize) -> u64 {
         u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as u64
     }
 
     #[allow(dead_code)]
     #[inline(always)]
-    pub(super) fn rapidhash_micro(bytes: &[u8]) -> u64 {
+    pub(super) const fn rapidhash_micro(bytes: &[u8]) -> u64 {
         rapidhash_micro_with_seed(bytes, 0)
     }
 
@@ -1108,7 +1189,7 @@ mod hasher {
     /// This is a small, non-cryptographic 64-bit hash. The output is identical on
     /// little- and big-endian targets.
     #[inline]
-    pub(super) fn rapidhash_micro_with_seed(bytes: &[u8], mut seed: u64) -> u64 {
+    pub(super) const fn rapidhash_micro_with_seed(bytes: &[u8], mut seed: u64) -> u64 {
         let len = bytes.len();
 
         seed ^= rapid_mix(
