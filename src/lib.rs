@@ -8,7 +8,7 @@
 //!
 //! A few things to note:
 //! - Once a number is entered, it pushes the floor up forever. Even after it is suspended, if that slot is ever reused again it will impose an arbitrary (based on who happened to use that slot before) floor on the new number that can be entered on that slot.
-//! - For any [`AtomicTrack`], all numbers must remain within a contiguous circular range narrower than MAX/**4** (or 2^(BITS - 2)) (inclusive) *at all times.* This is so that there is a well-defined "ahead" and "behind" relationship between numbers even across wraparounds (as in transitive ordering).
+//! - For any [`AtomicTrack`], all numbers must remain within a contiguous circular range narrower than MAX/**4** (or 2^(BITS - 2), or 2^(USER_BIT_LOW - 2) with custom reserved bits) (inclusive) *at all times.* This is so that there is a well-defined "ahead" and "behind" relationship between numbers even across wraparounds (as in transitive ordering).
 //! - Greater than and less than comparisons use wrapping-aware versions internally, so you might be surprised at some of the behavior when seeing edge cases. For example, on a fresh track, `enter_from(id, MSB / 2)` will initialize the lane to 0, because the halfway point on the ring has no unambiguous ordering relative to zero. If you keep to the rule that all numbers remain within the circular range mentioned above though, you probably won't notice most of the time.
 //! - Keys are not guaranteed to be unique; rather, it's loosely unique in the sense that it will tell you if it finds during the probe when inserting that there is a slot with that key already (*if* it finds it, it might not) or with [`AtomicTrack::recover`] and [`AtomicTrack::with_id`], returning the first matching lane with no promises that the result is unique. The [`NumberId`] should be considered the actual unique key.
 //! - Unless there's a `_concurrent` version of a function present, otherwise all functions can be assumed thread-safe.
@@ -50,7 +50,7 @@ pub mod futex;
 
 use MSB as SUSPENDED_BIT;
 
-use crate::math::{gte_msb_masked, max2_msb_masked, max3_msb_masked, min2_msb_masked};
+use crate::math::{number_mask, gte_masked, is_valid_user_bit_low, max2_masked, max3_masked, min2_masked, user_mask};
 
 const EMPTY_ID: NumericType = 0;
 const KEY_LOCK_BIT: NumericType = SUSPENDED_BIT;
@@ -124,12 +124,20 @@ const fn is_valid_public_value(value: NumericType) -> bool {
 }
 
 #[repr(C)]
-pub struct AtomicTrack<S: ?Sized = [CachePadded<Slot>]> {
+pub struct AtomicTrack<
+    S: ?Sized = [CachePadded<Slot>],
+    const USER_BIT_LOW: u32 = { NumericType::BITS },
+    const USER_BITS_DEFAULT: NumericType = 0,
+> {
     min: CachePadded<AtomicType>,
     slots: S,
 }
 
-pub type ArrayAtomicTrack<const N: usize> = AtomicTrack<[CachePadded<Slot>; N]>;
+pub type ArrayAtomicTrack<
+    const N: usize,
+    const USER_BIT_LOW: u32 = { NumericType::BITS },
+    const USER_BITS_DEFAULT: NumericType = 0,
+> = AtomicTrack<[CachePadded<Slot>; N], USER_BIT_LOW, USER_BITS_DEFAULT>;
 
 pub struct Slot {
     id: AtomicType,
@@ -178,7 +186,7 @@ pub enum NumberError {
     NotFound,
 }
 
-pub struct Number<'a> {
+pub struct Number<'a, const USER_BIT_LOW: u32 = { NumericType::BITS }> {
     slot: &'a CachePadded<Slot>,
     id: NumericType,
 }
@@ -188,9 +196,18 @@ const _: () = {
     assert_send_sync::<AtomicTrack>();
 };
 
-impl<const N: usize> ArrayAtomicTrack<N> {
+impl<S: ?Sized, const L: u32, const I: NumericType> AtomicTrack<S, L, I> {
+    const NUMBER_MASK: NumericType = number_mask(L);
+    const VALID: () = {
+        assert!(is_valid_user_bit_low(L), "USER_BIT_LOW should be within range 3..=NumericType::BITS");
+        assert!(I & !user_mask(L) == 0, "USER_BITS_DEFAULT must only use the user bits");
+    };
+}
+
+impl<const N: usize, const L: u32, const I: NumericType> ArrayAtomicTrack<N, L, I> {
     pub const fn new() -> Self {
         const { assert!(N.is_power_of_two(), "capacity must be a power of two") };
+        let () = Self::VALID;
         Self {
             min: CachePadded::new(AtomicType::new(0)),
             slots: [const { CachePadded::new(Slot::new()) }; N],
@@ -198,16 +215,16 @@ impl<const N: usize> ArrayAtomicTrack<N> {
     }
 }
 
-impl<const N: usize> Default for ArrayAtomicTrack<N> {
+impl<const N: usize, const L: u32, const I: NumericType> Default for ArrayAtomicTrack<N, L, I> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> Deref for ArrayAtomicTrack<N> {
-    type Target = AtomicTrack;
+impl<const N: usize, const L: u32, const I: NumericType> Deref for ArrayAtomicTrack<N, L, I> {
+    type Target = AtomicTrack<[CachePadded<Slot>], L, I>;
 
-    fn deref(&self) -> &AtomicTrack {
+    fn deref(&self) -> &Self::Target {
         self
     }
 }
@@ -223,14 +240,29 @@ impl AtomicTrack {
     }
 
     /// # Safety
+    /// Same as [`init_in_place`](`AtomicTrack::init_in_place`).
+    pub unsafe fn init_in_place_default<'a>(ptr: NonNull<u8>, capacity: usize) -> &'a Self {
+        unsafe { Self::init_in_place(ptr, capacity) }
+    }
+
+    /// # Safety
+    /// Same as [`from_raw`](`AtomicTrack::from_raw`).
+    pub unsafe fn from_raw_default<'a>(ptr: NonNull<u8>, capacity: usize) -> &'a Self {
+        unsafe { Self::from_raw(ptr, capacity) }
+    }
+}
+
+impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> {
+    /// # Safety
     /// `ptr` must be valid for writes, and with layout [`layout(capacity)`](`AtomicTrack::layout`). It must be aligned. It must stay valid for lifetime `'a`.
     pub unsafe fn init_in_place<'a>(ptr: NonNull<u8>, capacity: usize) -> &'a Self {
+        let () = Self::VALID;
         assert!(
             capacity.is_power_of_two(),
             "capacity must be a power of two"
         );
         assert!(
-            Self::layout(capacity).is_some(),
+            AtomicTrack::layout(capacity).is_some(),
             "capacity is too large"
         );
         let track = ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast::<CachePadded<Slot>>(), capacity) as *mut Self;
@@ -246,13 +278,15 @@ impl AtomicTrack {
 
     /// # Safety
     /// `ptr` must point to a track of exactly `capacity` number of slots that was initialized with [`init_in_place`](`AtomicTrack::init_in_place`) (or is otherwise laid out and initialized identically) and stays valid for `'a`.
+    /// Also note that if `USER_BIT_LOW` and `USER_BITS_DEFAULT` is different between when initialization happened and usage here, existing user bits might potentially become interpreted as the number part instead of the user bits part or vice versa.
     pub unsafe fn from_raw<'a>(ptr: NonNull<u8>, capacity: usize) -> &'a Self {
+        let () = Self::VALID;
         assert!(
             capacity.is_power_of_two(),
             "capacity must be a power of two"
         );
         assert!(
-            Self::layout(capacity).is_some(),
+            AtomicTrack::layout(capacity).is_some(),
             "capacity is too large"
         );
         unsafe {
@@ -283,7 +317,7 @@ impl AtomicTrack {
     }
 
     /// Just like [`recover`](`AtomicTrack::recover`), this is usually fast but since it *can* scan the whole ring, using [`with_number`](`AtomicTrack::with_number`) is better if you can.
-    pub fn with_id<R>(&self, id: NumericType, f: impl FnOnce(Number<'_>) -> R) -> Result<R, NumberError> {
+    pub fn with_id<R>(&self, id: NumericType, f: impl FnOnce(Number<'_, L>) -> R) -> Result<R, NumberError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(NumberError::InvalidId);
         }
@@ -294,12 +328,12 @@ impl AtomicTrack {
     pub fn with_number<R>(
         &self,
         number: NumberId,
-        f: impl FnOnce(Number<'_>) -> R,
+        f: impl FnOnce(Number<'_, L>) -> R,
     ) -> Result<R, NumberError> {
         self.number(number).map(f)
     }
 
-    pub fn number(&self, number: NumberId) -> Result<Number<'_>, NumberError> {
+    pub fn number(&self, number: NumberId) -> Result<Number<'_, L>, NumberError> {
         let slot = self.get_slot_concurrent(number)?;
         Ok(Number {
             slot,
@@ -342,9 +376,9 @@ impl AtomicTrack {
             }
 
             let desired_value = if __concurrent_write_leave {
-                without_suspended_bit(current.wrapping_add(1))
+                current.wrapping_add(1) & Self::NUMBER_MASK
             } else {
-                without_suspended_bit(current)
+                current & Self::NUMBER_MASK
             };
 
             let desired = with_suspended_bit(desired_value);
@@ -395,11 +429,15 @@ impl AtomicTrack {
                     debug_assert!(is_suspended(current));
 
                     // Resume from max(current_lane_floor, global_min, at_least)
-                    let desired = max3_msb_masked(
-                        without_suspended_bit(current),
-                        self.min.load(Ordering::Acquire),
-                        at_least,
-                    );
+                    let desired = {
+                        let three_way_max = max3_masked(
+                            without_suspended_bit(current),
+                            self.min.load(Ordering::Acquire),
+                            at_least,
+                            Self::NUMBER_MASK,
+                        );
+                        (three_way_max & Self::NUMBER_MASK) | I
+                    };
 
                     // CAS to enter active state
                     match slot.value.compare_exchange(
@@ -465,11 +503,11 @@ impl AtomicTrack {
                     continue;
                 }
 
-                let number = without_suspended_bit(value);
+                let number = value & Self::NUMBER_MASK;
 
                 if !is_suspended(value) && key_bits(id_before) != EMPTY_ID {
                     active_max = Some(match active_max {
-                        Some(current) => max2_msb_masked(current, number),
+                        Some(current) => max2_masked(current, number, Self::NUMBER_MASK),
                         None => number,
                     });
                 }
@@ -493,9 +531,9 @@ impl AtomicTrack {
                 let mut current = slot.value.load(Ordering::Acquire);
 
                 'inner: while is_suspended(current) {
-                    let current_value = without_suspended_bit(current);
+                    let current_value = current & Self::NUMBER_MASK;
 
-                    if gte_msb_masked(current_value, running_min) {
+                    if gte_masked(current_value, running_min, Self::NUMBER_MASK) {
                         let id_after = slot.id.load(Ordering::Acquire);
                         if id_before != id_after {
                             core::hint::spin_loop();
@@ -526,7 +564,7 @@ impl AtomicTrack {
                 }
 
                 if key_bits(id_before) != EMPTY_ID {
-                    running_min = min2_msb_masked(running_min, without_suspended_bit(current));
+                    running_min = min2_masked(running_min, current & Self::NUMBER_MASK, Self::NUMBER_MASK);
                 }
 
                 continue 'outer;
@@ -536,7 +574,7 @@ impl AtomicTrack {
         let mut current = self.min.load(Ordering::Relaxed);
 
         let previous = loop {
-            let new_value = max2_msb_masked(current, running_min);
+            let new_value = max2_masked(current, running_min, Self::NUMBER_MASK);
 
             match self.min.compare_exchange_weak(
                 current,
@@ -549,7 +587,7 @@ impl AtomicTrack {
             }
         };
 
-        max2_msb_masked(previous, running_min)
+        max2_masked(previous, running_min, Self::NUMBER_MASK)
     }
 
     fn offset_as_usize(&self, offset: u64) -> Result<usize, NumberError> {
@@ -586,7 +624,10 @@ impl AtomicTrack {
     }
 }
 
-impl<'a> Number<'a> {
+impl<'a, const L: u32> Number<'a, L> {
+    const NUMBER_MASK: NumericType = number_mask(L);
+    const USER_MASK: NumericType = user_mask(L);
+
     pub fn get(&self) -> Result<NumericType, NumberError> {
         loop {
             let key_before = self.slot.id.load(Ordering::Acquire);
@@ -626,7 +667,8 @@ impl<'a> Number<'a> {
                 return Err(NumberError::NotFound);
             }
 
-            let desired = max2_msb_masked(without_suspended_bit(current), at_least);
+            let desired = max2_masked(current & Self::NUMBER_MASK, at_least & Self::NUMBER_MASK, Self::NUMBER_MASK)
+                | (at_least & Self::USER_MASK);
 
             let key_after = self.slot.id.load(Ordering::Acquire);
             if key_before != key_after {
@@ -661,7 +703,8 @@ impl<'a> Number<'a> {
                 return Err(NumberError::NotFound);
             }
 
-            let next = without_suspended_bit(current.wrapping_add(delta));
+            let next = (current.wrapping_add(delta) & Self::NUMBER_MASK)
+                | (delta & Self::USER_MASK);
 
             let key_after = self.slot.id.load(Ordering::Acquire);
             if key_before != key_after {
@@ -705,6 +748,84 @@ mod tests {
 
     static STATIC_TRACK: ArrayAtomicTrack<4> = ArrayAtomicTrack::new();
 
+    const ONE_USER_BIT: u32 = NumericType::BITS - 1;
+    const FLAG: NumericType = 1 << (NumericType::BITS - 2);
+    const TWO_USER_BITS: u32 = NumericType::BITS - 2;
+    const LOWER_FLAG_OF_TWO: NumericType = 1 << (NumericType::BITS - 3);
+
+    #[test]
+    fn user_bits_start_at_initial_and_reset_on_reentry() {
+        let track = ArrayAtomicTrack::<1, ONE_USER_BIT, FLAG>::new();
+        let a = track.enter(1).unwrap();
+        let number = track.number(a).unwrap();
+        assert_eq!(number.get(), Ok(FLAG));
+        assert_eq!(number.add(7), Ok(7));
+        track.leave(a).unwrap();
+
+        let b = track.enter(2).unwrap();
+        assert_eq!(track.number(b).unwrap().get(), Ok(FLAG | 7));
+    }
+
+    #[test]
+    fn raise_to_overwrites_user_bits_and_round_trips_get() {
+        let track = ArrayAtomicTrack::<1, ONE_USER_BIT>::new();
+        let number_id = track.enter(1).unwrap();
+        let number = track.number(number_id).unwrap();
+
+        assert_eq!(number.raise_to(FLAG | 5), Ok(FLAG | 5));
+        assert_eq!(number.raise_to(3), Ok(5));
+        assert_eq!(number.raise_to(FLAG), Ok(FLAG | 5));
+        let value = number.get().unwrap();
+        assert_eq!(number.raise_to(value), Ok(value));
+    }
+
+    #[test]
+    fn add_overwrites_user_bits_and_never_carries_the_counter_into_them() {
+        let track = ArrayAtomicTrack::<1, TWO_USER_BITS, LOWER_FLAG_OF_TWO>::new();
+        let counter = number_mask(TWO_USER_BITS);
+        let high = LOWER_FLAG_OF_TWO << 1;
+        let number_id = track.enter(1).unwrap();
+        let number = track.number(number_id).unwrap();
+
+        assert_eq!(number.add(high | counter), Ok(high | counter));
+        assert_eq!(number.add(high | 1), Ok(high));
+        assert_eq!(number.add(LOWER_FLAG_OF_TWO | 5), Ok(LOWER_FLAG_OF_TWO | 5));
+        assert_eq!(number.add(high | LOWER_FLAG_OF_TWO), Ok(high | LOWER_FLAG_OF_TWO | 5));
+        assert_eq!(number.add(0), Ok(5));
+    }
+
+    #[test]
+    fn min_and_find_min_only_see_the_counter() {
+        let track = ArrayAtomicTrack::<4, ONE_USER_BIT, FLAG>::new();
+        let a = track.enter(1).unwrap();
+        let b = track.enter(2).unwrap();
+        track.number(a).unwrap().raise_to(FLAG | 10).unwrap();
+        track.number(b).unwrap().raise_to(FLAG | 7).unwrap();
+
+        assert_eq!(track.find_min(), 7);
+        assert_eq!(track.min(), 7);
+
+        let c = track.enter(3).unwrap();
+        assert_eq!(track.number(c).unwrap().get(), Ok(FLAG | 7));
+    }
+
+    #[test]
+    fn custom_raw_constructors_apply_the_parameters() {
+        let layout = AtomicTrack::layout(2).unwrap();
+        unsafe {
+            let ptr = NonNull::new(std::alloc::alloc(layout)).unwrap();
+            let track: &AtomicTrack<_, ONE_USER_BIT, FLAG> = AtomicTrack::init_in_place(ptr, 2);
+            let number_id = track.enter(1).unwrap();
+            assert_eq!(track.number(number_id).unwrap().get(), Ok(FLAG));
+
+            let cast: &AtomicTrack<_, ONE_USER_BIT, FLAG> = AtomicTrack::from_raw(ptr, 2);
+            assert_eq!(cast.number(number_id).unwrap().add(0), Ok(0));
+            assert_eq!(track.number(number_id).unwrap().get(), Ok(0));
+
+            std::alloc::dealloc(ptr.as_ptr(), layout);
+        }
+    }
+
     #[test]
     fn static_track_is_usable() {
         let track: &AtomicTrack = &STATIC_TRACK;
@@ -741,14 +862,14 @@ mod tests {
         let layout = AtomicTrack::layout(4).unwrap();
         unsafe {
             let ptr = NonNull::new(std::alloc::alloc(layout)).unwrap();
-            let track = AtomicTrack::init_in_place(ptr, 4);
+            let track = AtomicTrack::init_in_place_default(ptr, 4);
             assert_eq!(track.capacity(), 4);
             assert_eq!(track.min(), 0);
 
             let number = track.enter(3).unwrap();
             track.number(number).unwrap().raise_to(9).unwrap();
 
-            let cast = AtomicTrack::from_raw(ptr, 4);
+            let cast = AtomicTrack::from_raw_default(ptr, 4);
             assert_eq!(cast.capacity(), 4);
             assert_eq!(cast.recover(3), Some(number));
             assert_eq!(cast.with_id(3, |lane| lane.get()).unwrap(), Ok(9));
@@ -765,7 +886,7 @@ mod tests {
         unsafe {
             let ptr = NonNull::new(std::alloc::alloc(layout)).unwrap();
             ptr.as_ptr().write_bytes(0xAB, layout.size());
-            let track = AtomicTrack::init_in_place(ptr, 2);
+            let track = AtomicTrack::init_in_place_default(ptr, 2);
             assert_eq!(track.min(), 0);
             assert_eq!(track.recover(1), None);
             let number = track.enter(1).unwrap();
@@ -779,7 +900,7 @@ mod tests {
     fn init_in_place_rejects_non_power_of_two() {
         let mut buffer = ArrayAtomicTrack::<4>::new();
         unsafe {
-            AtomicTrack::init_in_place(NonNull::from(&mut buffer).cast(), 3);
+            AtomicTrack::init_in_place_default(NonNull::from(&mut buffer).cast(), 3);
         }
     }
 

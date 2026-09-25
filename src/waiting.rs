@@ -21,7 +21,7 @@ use core::{alloc::Layout, hash::{Hash, Hasher}, ptr::{self, NonNull}, sync::atom
 #[cfg(feature = "std")]
 use std::boxed::Box;
 
-use crate::{AtomicTrack, EMPTY_ID, Slot, cache_padded::CachePadded, EnterError, LeaveError, Number, NumberError, NumberId, env_or_default, futex, is_key_locked, is_suspended, key_bits, math::{AtomicType, NumericType, gte_msb_masked}, spin_for_step, utils::{MAX_LOOPS_BEFORE_SLEEP, MAX_SPINS, yield_now}, without_suspended_bit};
+use crate::{AtomicTrack, EMPTY_ID, Slot, cache_padded::CachePadded, EnterError, LeaveError, Number, NumberError, NumberId, env_or_default, futex, is_key_locked, is_suspended, key_bits, math::{AtomicType, NumericType, number_mask, gte_masked, user_mask}, spin_for_step, utils::{MAX_LOOPS_BEFORE_SLEEP, MAX_SPINS, yield_now}, without_suspended_bit};
 
 const DEFAULT_NUM_FUTEXES: usize = env_or_default!("ATOMICTRACK_FUTEX_POOL_SIZE", "1024", usize);
 const _: () = {
@@ -139,9 +139,9 @@ fn futex(i: usize) -> &'static AtomicU32 {
     &futexes[i & (futexes.len() - 1)]
 }
 
-fn get_futex(a: &AtomicTrack, b: NumericType) -> &'static AtomicU32 {
+fn get_futex<T: ?Sized>(a: &T, b: NumericType) -> &'static AtomicU32 {
     let mut hasher = hasher::RhmHasher::default();
-    (a as *const AtomicTrack).addr().hash(&mut hasher);
+    (a as *const T).addr().hash(&mut hasher);
     b.hash(&mut hasher);
     futex(hasher.finish() as usize)
 }
@@ -160,9 +160,9 @@ pub const fn id_of(name: &str) -> NumericType {
 }
 
 #[repr(C)]
-struct Shared<S: ?Sized = [CachePadded<Slot>]> {
+struct Shared<const L: u32, const I: NumericType, S: ?Sized = [CachePadded<Slot>]> {
     handle_count: AtomicUsize,
-    track: AtomicTrack<S>,
+    track: AtomicTrack<S, L, I>,
 }
 
 fn shared_layout(capacity: usize) -> Layout {
@@ -178,12 +178,15 @@ fn shared_layout(capacity: usize) -> Layout {
     layout.pad_to_align()
 }
 
-pub struct AtomicTrackWaiting {
-    shared: NonNull<Shared>,
+pub struct AtomicTrackWaiting<
+    const USER_BIT_LOW: u32 = { NumericType::BITS },
+    const USER_BITS_DEFAULT: NumericType = 0,
+> {
+    shared: NonNull<Shared<USER_BIT_LOW, USER_BITS_DEFAULT>>,
 }
 
-unsafe impl Send for AtomicTrackWaiting {}
-unsafe impl Sync for AtomicTrackWaiting {}
+unsafe impl<const L: u32, const I: NumericType> Send for AtomicTrackWaiting<L, I> {}
+unsafe impl<const L: u32, const I: NumericType> Sync for AtomicTrackWaiting<L, I> {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitError {
@@ -191,19 +194,32 @@ pub enum WaitError {
     NotFound,
 }
 
-pub struct NumberWaiting<'a, 'b> {
-    inner: Number<'a>,
-    atomic_track_waiting: &'b AtomicTrackWaiting,
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitGteStatus {
+    Reached = 0,
+    ReservedBitsModified = 1,
+    TimedOut = 2,
 }
 
-impl Clone for AtomicTrackWaiting {
+pub struct NumberWaiting<
+    'a,
+    'b,
+    const USER_BIT_LOW: u32 = { NumericType::BITS },
+    const USER_BITS_DEFAULT: NumericType = 0,
+> {
+    inner: Number<'a, USER_BIT_LOW>,
+    atomic_track_waiting: &'b AtomicTrackWaiting<USER_BIT_LOW, USER_BITS_DEFAULT>,
+}
+
+impl<const L: u32, const I: NumericType> Clone for AtomicTrackWaiting<L, I> {
     fn clone(&self) -> Self {
         self.shared().handle_count.fetch_add(1, Ordering::Relaxed);
         Self { shared: self.shared }
     }
 }
 
-impl Drop for AtomicTrackWaiting {
+impl<const L: u32, const I: NumericType> Drop for AtomicTrackWaiting<L, I> {
     fn drop(&mut self) {
         if self.shared().handle_count.fetch_sub(1, Ordering::Release) == 1 {
             core::sync::atomic::fence(Ordering::Acquire);
@@ -214,26 +230,35 @@ impl Drop for AtomicTrackWaiting {
 }
 
 impl AtomicTrackWaiting {
+    pub fn new_default(capacity: usize) -> Self {
+        Self::new(capacity)
+    }
+}
+
+impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
+    const NUMBER_MASK: NumericType = number_mask(L);
+    const USER_MASK: NumericType = user_mask(L);
+
     pub fn new(capacity: usize) -> Self {
         let layout = shared_layout(capacity);
         unsafe {
             let Some(ptr) = NonNull::new(std::alloc::alloc(layout)) else {
                 std::alloc::handle_alloc_error(layout);
             };
-            let shared = ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast::<CachePadded<Slot>>(), capacity) as *mut Shared;
+            let shared = ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast::<CachePadded<Slot>>(), capacity) as *mut Shared<L, I>;
             (&raw mut (*shared).handle_count).write(AtomicUsize::new(1));
-            AtomicTrack::init_in_place(NonNull::new_unchecked((&raw mut (*shared).track).cast::<u8>()), capacity);
+            AtomicTrack::<[CachePadded<Slot>], L, I>::init_in_place(NonNull::new_unchecked((&raw mut (*shared).track).cast::<u8>()), capacity);
             Self { shared: NonNull::new_unchecked(shared) }
         }
     }
 
     #[inline]
-    fn shared(&self) -> &Shared {
+    fn shared(&self) -> &Shared<L, I> {
         unsafe { self.shared.as_ref() }
     }
 
     #[inline]
-    fn track(&self) -> &AtomicTrack {
+    fn track(&self) -> &AtomicTrack<[CachePadded<Slot>], L, I> {
         &self.shared().track
     }
 
@@ -275,7 +300,7 @@ impl AtomicTrackWaiting {
     pub fn with_id<R>(
         &self,
         id: NumericType,
-        f: impl FnOnce(NumberWaiting<'_, '_>) -> R,
+        f: impl FnOnce(NumberWaiting<'_, '_, L, I>) -> R,
     ) -> Result<R, NumberError> {
         self.track().with_id(id, |number| {
             f(NumberWaiting {
@@ -288,7 +313,7 @@ impl AtomicTrackWaiting {
     pub fn with_number<R>(
         &self,
         number: NumberId,
-        f: impl FnOnce(NumberWaiting<'_, '_>) -> R,
+        f: impl FnOnce(NumberWaiting<'_, '_, L, I>) -> R,
     ) -> Result<R, NumberError> {
         self.track().with_number(number, |number| {
             f(NumberWaiting {
@@ -298,7 +323,7 @@ impl AtomicTrackWaiting {
         })
     }
 
-    pub fn number(&self, number: NumberId) -> Result<NumberWaiting<'_, '_>, NumberError> {
+    pub fn number(&self, number: NumberId) -> Result<NumberWaiting<'_, '_, L, I>, NumberError> {
         self.track().number(number).map(|number| NumberWaiting {
             inner: number,
             atomic_track_waiting: self,
@@ -313,7 +338,7 @@ impl AtomicTrackWaiting {
         self.__wait_for_enter_timeout(id, Some((timeout_ns, Instant::now())))
     }
 
-    pub fn wait_for_number(&self, id: NumericType) -> Result<NumberWaiting<'_, '_>, WaitError> {
+    pub fn wait_for_number(&self, id: NumericType) -> Result<NumberWaiting<'_, '_, L, I>, WaitError> {
         #[cfg(debug_assertions)]
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
@@ -327,7 +352,7 @@ impl AtomicTrackWaiting {
         }
     }
 
-    pub fn wait_for_number_timeout(&self, id: NumericType, timeout_ns: u64) -> Result<NumberWaiting<'_, '_>, WaitError> {
+    pub fn wait_for_number_timeout(&self, id: NumericType, timeout_ns: u64) -> Result<NumberWaiting<'_, '_, L, I>, WaitError> {
         #[cfg(debug_assertions)]
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
@@ -342,15 +367,49 @@ impl AtomicTrackWaiting {
     }
 
     pub fn wait_gte(&self, id: NumericType, at_least: NumericType) -> Result<(NumericType, NumberId), WaitError> {
-        match self.__wait_for_enter_and_at_least_timeout(id, at_least, None) {
-            Ok((true, value, number_id)) => Ok((value, number_id)),
-            Ok((false, _, _)) => unreachable!(),
-            Err(e) => Err(e),
+        match self.__wait_for_enter_and_at_least_timeout(id, at_least, None, None)? {
+            (WaitGteStatus::Reached, value, number_id) => Ok((value, number_id)),
+            _ => unreachable!(),
         }
     }
 
     pub fn wait_gte_timeout(&self, id: NumericType, at_least: NumericType, timeout_ns: u64) -> Result<(bool, NumericType, NumberId), WaitError> {
-        self.__wait_for_enter_and_at_least_timeout(id, at_least, Some((timeout_ns, Instant::now())))
+        let (status, value, number_id) = self.__wait_for_enter_and_at_least_timeout(id, at_least, None, Some((timeout_ns, Instant::now())))?;
+        Ok((status == WaitGteStatus::Reached, value, number_id))
+    }
+
+    /// See [`NumberWaiting::wait_gte_sicrbm`].
+    pub fn wait_gte_sicrbm(&self, id: NumericType, at_least: NumericType, expected_user_bits: NumericType) -> Result<(WaitGteStatus, NumericType, NumberId), WaitError> {
+        self.__wait_for_enter_and_at_least_timeout(id, at_least, Some(expected_user_bits), None)
+    }
+
+    pub fn wait_gte_timeout_sicrbm(&self, id: NumericType, at_least: NumericType, expected_user_bits: NumericType, timeout_ns: u64) -> Result<(WaitGteStatus, NumericType, NumberId), WaitError> {
+        self.__wait_for_enter_and_at_least_timeout(id, at_least, Some(expected_user_bits), Some((timeout_ns, Instant::now())))
+    }
+
+    /// Loads the current futex word for `id`. Check your own condition, then pass this loaded value to [`wait_spurious`](`AtomicTrackWaiting::wait_spurious`) if you still need to wait. Any signal on `id` after the load makes the wait return immediately, including spuriously.
+    pub fn futex_word_value(&self, id: NumericType) -> Result<u32, WaitError> {
+        if id == EMPTY_ID || is_key_locked(id) {
+            return Err(WaitError::InvalidId);
+        }
+        Ok(get_futex(self.track(), id).load(Ordering::Acquire))
+    }
+
+    /// Sleeps while the futex word for `id` still equals `expected`. Can return spuriously, especially since the number of futexes is fixed and futexes are shared with other ids.
+    pub fn wait_spurious(&self, id: NumericType, expected: u32) -> Result<(), WaitError> {
+        if id == EMPTY_ID || is_key_locked(id) {
+            return Err(WaitError::InvalidId);
+        }
+        futex::wait(get_futex(self.track(), id), expected);
+        Ok(())
+    }
+
+    /// Returns `Ok(false)` only when the operating system reports that the timeout elapsed.
+    pub fn wait_spurious_timeout(&self, id: NumericType, expected: u32, timeout_ns: u64) -> Result<bool, WaitError> {
+        if id == EMPTY_ID || is_key_locked(id) {
+            return Err(WaitError::InvalidId);
+        }
+        Ok(futex::wait_timeout(get_futex(self.track(), id), expected, timeout_ns))
     }
 
     fn __wait_for_enter_timeout(&self, id: NumericType, timeout_ns: Option<(u64, Instant)>) -> Result<NumberId, WaitError> {
@@ -413,7 +472,7 @@ impl AtomicTrackWaiting {
         }
     }
 
-    fn __wait_for_enter_and_at_least_timeout(&self, id: NumericType, at_least: NumericType, timeout_ns: Option<(u64, Instant)>) -> Result<(bool, NumericType, NumberId), WaitError> {
+    fn __wait_for_enter_and_at_least_timeout(&self, id: NumericType, at_least: NumericType, expected_user_bits: Option<NumericType>, timeout_ns: Option<(u64, Instant)>) -> Result<(WaitGteStatus, NumericType, NumberId), WaitError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
         }
@@ -460,8 +519,14 @@ impl AtomicTrackWaiting {
                 }
 
                 // Check if value is gte at_least.
-                if gte_msb_masked(without_suspended_bit(value_tmp), at_least) {
-                    return Ok((true, without_suspended_bit(value_tmp), number_id.clone()));
+                if gte_masked(value_tmp, at_least, Self::NUMBER_MASK) {
+                    return Ok((WaitGteStatus::Reached, without_suspended_bit(value_tmp), *number_id));
+                }
+
+                if let Some(expected) = expected_user_bits
+                    && (value_tmp ^ expected) & Self::USER_MASK != 0
+                {
+                    return Ok((WaitGteStatus::ReservedBitsModified, without_suspended_bit(value_tmp), *number_id));
                 }
 
                 value = Some(value_tmp);
@@ -488,7 +553,7 @@ impl AtomicTrackWaiting {
                             if freeze >= *timeout_ns {
                                 match (value, &number) {
                                     (Some(value), Some((_, number_id))) => {
-                                        return Ok((false, without_suspended_bit(value), number_id.clone()));
+                                        return Ok((WaitGteStatus::TimedOut, without_suspended_bit(value), *number_id));
                                     },
                                     _ => {},
                                 }
@@ -509,7 +574,7 @@ impl AtomicTrackWaiting {
                     if start.elapsed().as_nanos() as u64 >= *timeout_ns {
                         match (value, &number) {
                             (Some(value), Some((_, number_id))) => {
-                                return Ok((false, without_suspended_bit(value), number_id.clone()));
+                                return Ok((WaitGteStatus::TimedOut, without_suspended_bit(value), *number_id));
                             },
                             _ => {},
                         }
@@ -538,7 +603,7 @@ impl AtomicTrackWaiting {
     }
 }
 
-impl<'a, 'b> NumberWaiting<'a, 'b> {
+impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
     pub fn get(&self) -> Result<NumericType, NumberError> {
         self.inner.get()
     }
@@ -562,18 +627,42 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
     }
 
     pub fn wait_gte(&self, at_least: NumericType) -> Result<NumericType, WaitError> {
-        match self.__wait_gte_timeout(at_least, None) {
-            Ok((true, value)) => Ok(value),
-            Ok((false, _)) => unreachable!(),
-            Err(e) => Err(e),
+        match self.__wait_gte_timeout(at_least, None, None)? {
+            (WaitGteStatus::Reached, value) => Ok(value),
+            _ => unreachable!(),
         }
     }
 
     pub fn wait_gte_timeout(&self, at_least: NumericType, timeout_ns: u64) -> Result<(bool, NumericType), WaitError> {
-        self.__wait_gte_timeout(at_least, Some((timeout_ns, Instant::now())))
+        let (status, value) = self.__wait_gte_timeout(at_least, None, Some((timeout_ns, Instant::now())))?;
+        Ok((status == WaitGteStatus::Reached, value))
     }
 
-    fn __wait_gte_timeout(&self, at_least: NumericType, timeout_ns: Option<(u64, Instant)>) -> Result<(bool, NumericType), WaitError> {
+    /// SICRBM (Stop If Custom Reserved Bits Modified)
+    pub fn wait_gte_sicrbm(&self, at_least: NumericType, expected_user_bits: NumericType) -> Result<(WaitGteStatus, NumericType), WaitError> {
+        self.__wait_gte_timeout(at_least, Some(expected_user_bits), None)
+    }
+
+    pub fn wait_gte_timeout_sicrbm(&self, at_least: NumericType, expected_user_bits: NumericType, timeout_ns: u64) -> Result<(WaitGteStatus, NumericType), WaitError> {
+        self.__wait_gte_timeout(at_least, Some(expected_user_bits), Some((timeout_ns, Instant::now())))
+    }
+
+    /// See [`AtomicTrackWaiting::futex_word_value`].
+    pub fn futex_word_value(&self) -> u32 {
+        get_futex(self.atomic_track_waiting.track(), self.inner.id).load(Ordering::Acquire)
+    }
+
+    /// See [`AtomicTrackWaiting::wait_spurious`].
+    pub fn wait_spurious(&self, expected: u32) {
+        futex::wait(get_futex(self.atomic_track_waiting.track(), self.inner.id), expected);
+    }
+
+    /// See [`AtomicTrackWaiting::wait_spurious_timeout`].
+    pub fn wait_spurious_timeout(&self, expected: u32, timeout_ns: u64) -> bool {
+        futex::wait_timeout(get_futex(self.atomic_track_waiting.track(), self.inner.id), expected, timeout_ns)
+    }
+
+    fn __wait_gte_timeout(&self, at_least: NumericType, expected_user_bits: Option<NumericType>, timeout_ns: Option<(u64, Instant)>) -> Result<(WaitGteStatus, NumericType), WaitError> {
         let mut i = 0;
         let mut f = None;
         let mut futex_value_before = 0;
@@ -606,8 +695,14 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
             }
 
             // Check if value is gte at_least.
-            if gte_msb_masked(without_suspended_bit(value), at_least) {
-                return Ok((true, without_suspended_bit(value)));
+            if gte_masked(value, at_least, AtomicTrackWaiting::<L, I>::NUMBER_MASK) {
+                return Ok((WaitGteStatus::Reached, without_suspended_bit(value)));
+            }
+
+            if let Some(expected) = expected_user_bits
+                && (value ^ expected) & AtomicTrackWaiting::<L, I>::USER_MASK != 0
+            {
+                return Ok((WaitGteStatus::ReservedBitsModified, without_suspended_bit(value)));
             }
 
             i += 1;
@@ -629,7 +724,7 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
                         Some((timeout_ns, start)) => {
                             let freeze = start.elapsed().as_nanos() as u64;
                             if freeze >= *timeout_ns {
-                                return Ok((false, without_suspended_bit(value)));
+                                return Ok((WaitGteStatus::TimedOut, without_suspended_bit(value)));
                             }
                             let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze);
                         },
@@ -644,7 +739,7 @@ impl<'a, 'b> NumberWaiting<'a, 'b> {
             match &timeout_ns {
                 Some((timeout_ns, start)) => {
                     if start.elapsed().as_nanos() as u64 >= *timeout_ns {
-                        return Ok((false, without_suspended_bit(value)));
+                        return Ok((WaitGteStatus::TimedOut, without_suspended_bit(value)));
                     }
                 },
                 _ => {},
@@ -711,6 +806,159 @@ mod tests {
         (result, elapsed)
     }
 
+    const ONE_USER_BIT: u32 = NumericType::BITS - 1;
+    const FLAG: NumericType = 1 << (NumericType::BITS - 2);
+
+    #[test]
+    fn sicrbm_number_wait_stops_on_user_bit_change_but_not_on_counter_change() {
+        let track = AtomicTrackWaiting::<ONE_USER_BIT>::new(4);
+        let number_id = track.enter(3).unwrap();
+        let waiter_track = track.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter_barrier = Arc::clone(&barrier);
+        let waiter = thread::spawn(move || {
+            let number = waiter_track.number(number_id).unwrap();
+            waiter_barrier.wait();
+            number.wait_gte_timeout_sicrbm(100, 0, TEST_TIMEOUT_NS)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        let number = track.number(number_id).unwrap();
+        number.add(5).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        number.add(FLAG).unwrap();
+
+        assert_eq!(waiter.join().unwrap(), Ok((WaitGteStatus::ReservedBitsModified, FLAG | 5)));
+        assert_eq!(number.wait_gte_timeout_sicrbm(100, FLAG, 0), Ok((WaitGteStatus::TimedOut, FLAG | 5)));
+        assert_eq!(number.wait_gte_sicrbm(5, 0), Ok((WaitGteStatus::Reached, FLAG | 5)));
+        assert_eq!(number.wait_gte_timeout(100, 0), Ok((false, FLAG | 5)));
+    }
+
+    #[test]
+    fn sicrbm_catches_a_change_made_before_the_wait_started() {
+        let track = AtomicTrackWaiting::<ONE_USER_BIT>::new(4);
+        let number_id = track.enter(3).unwrap();
+        let number = track.number(number_id).unwrap();
+        let seen = number.get().unwrap();
+        number.add(FLAG).unwrap();
+
+        assert_eq!(number.wait_gte_sicrbm(100, seen), Ok((WaitGteStatus::ReservedBitsModified, FLAG)));
+        assert_eq!(track.wait_gte_sicrbm(3, 100, seen), Ok((WaitGteStatus::ReservedBitsModified, FLAG, number_id)));
+        assert_eq!(number.wait_gte_timeout_sicrbm(100, seen | 7, 0), Ok((WaitGteStatus::ReservedBitsModified, FLAG)));
+        assert_eq!(number.wait_gte_timeout_sicrbm(100, FLAG | 7, 0), Ok((WaitGteStatus::TimedOut, FLAG)));
+    }
+
+    #[test]
+    fn sicrbm_key_wait_stops_on_user_bit_change() {
+        let track = AtomicTrackWaiting::<ONE_USER_BIT, FLAG>::new(4);
+        let number_id = track.enter(3).unwrap();
+        let waiter_track = track.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter_barrier = Arc::clone(&barrier);
+        let waiter = thread::spawn(move || {
+            waiter_barrier.wait();
+            waiter_track.wait_gte_timeout_sicrbm(3, 100, FLAG, TEST_TIMEOUT_NS)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        track.number(number_id).unwrap().raise_to(2).unwrap();
+
+        assert_eq!(waiter.join().unwrap(), Ok((WaitGteStatus::ReservedBitsModified, 2, number_id)));
+        assert_eq!(track.wait_gte_timeout(3, 100, 0), Ok((false, 2, number_id)));
+        assert_eq!(track.wait_gte_sicrbm(3, 2, FLAG), Ok((WaitGteStatus::Reached, 2, number_id)));
+    }
+
+    #[test]
+    fn sicrbm_key_wait_compares_a_late_entrant_against_the_expected_bits() {
+        let track = AtomicTrackWaiting::<ONE_USER_BIT, FLAG>::new(4);
+        assert_eq!(track.wait_gte_timeout_sicrbm(3, 100, FLAG, 0), Err(WaitError::NotFound));
+
+        let waiter_track = track.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter_barrier = Arc::clone(&barrier);
+        let waiter = thread::spawn(move || {
+            waiter_barrier.wait();
+            waiter_track.wait_gte_timeout_sicrbm(3, 100, 0, TEST_TIMEOUT_NS)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        let number_id = track.enter(3).unwrap();
+
+        assert_eq!(waiter.join().unwrap(), Ok((WaitGteStatus::ReservedBitsModified, FLAG, number_id)));
+        assert_eq!(track.wait_gte_timeout_sicrbm(3, 100, FLAG, 0), Ok((WaitGteStatus::TimedOut, FLAG, number_id)));
+    }
+
+    #[test]
+    fn wait_spurious_returns_immediately_after_a_signal_since_the_load() {
+        let track = AtomicTrackWaiting::new_default(4);
+        let number_id = track.enter(3).unwrap();
+        let word = track.futex_word_value(3).unwrap();
+        let number = track.number(number_id).unwrap();
+        let number_word = number.futex_word_value();
+        assert_eq!(word, number_word);
+        number.add(1).unwrap();
+
+        let started = Instant::now();
+        assert_eq!(track.wait_spurious_timeout(3, word, TEST_TIMEOUT_NS), Ok(true));
+        assert!(number.wait_spurious_timeout(number_word, TEST_TIMEOUT_NS));
+        track.wait_spurious(3, word).unwrap();
+        number.wait_spurious(number_word);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        assert!((0..5).any(|_| !number.wait_spurious_timeout(number.futex_word_value(), 1_000_000)));
+    }
+
+    #[test]
+    fn wait_spurious_wakes_a_hand_rolled_wait_loop() {
+        let track = AtomicTrackWaiting::new_default(4);
+        let number_id = track.enter(3).unwrap();
+        let waiter_track = track.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter_barrier = Arc::clone(&barrier);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let waiter = thread::spawn(move || {
+            let number = waiter_track.number(number_id).unwrap();
+            waiter_barrier.wait();
+            loop {
+                let word = number.futex_word_value();
+                let value = number.get().unwrap();
+                if value >= 5 {
+                    sender.send(value).unwrap();
+                    return;
+                }
+                number.wait_spurious(word);
+            }
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        track.number(number_id).unwrap().raise_to(5).unwrap();
+
+        assert_eq!(receiver.recv_timeout(TEST_WATCHDOG).expect("hand-rolled wait did not wake"), 5);
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn wait_gte_status_discriminants_are_fixed() {
+        assert_eq!(WaitGteStatus::Reached as u32, 0);
+        assert_eq!(WaitGteStatus::ReservedBitsModified as u32, 1);
+        assert_eq!(WaitGteStatus::TimedOut as u32, 2);
+        assert_eq!(size_of::<WaitGteStatus>(), size_of::<core::ffi::c_int>());
+    }
+
+    #[test]
+    fn futex_word_value_and_wait_spurious_validate_ids() {
+        let track = AtomicTrackWaiting::new_default(4);
+        let word = track.futex_word_value(3).unwrap();
+        assert_eq!(track.futex_word_value(EMPTY_ID), Err(WaitError::InvalidId));
+        assert_eq!(track.futex_word_value(MSB | 3), Err(WaitError::InvalidId));
+        assert_eq!(track.wait_spurious(EMPTY_ID, word), Err(WaitError::InvalidId));
+        assert_eq!(track.wait_spurious_timeout(MSB | 3, word, 0), Err(WaitError::InvalidId));
+    }
+
     #[test]
     fn id_of_output_is_pinned() {
         #[cfg(not(feature = "smaller-atomics"))]
@@ -760,7 +1008,7 @@ mod tests {
 
     #[test]
     fn id_of_names_the_same_number_for_entering_and_waiting() {
-        let track = AtomicTrackWaiting::new(8);
+        let track = AtomicTrackWaiting::new_default(8);
         let waiter_track = track.clone();
         let barrier = Arc::new(Barrier::new(2));
         let waiter_barrier = Arc::clone(&barrier);
@@ -781,7 +1029,7 @@ mod tests {
 
     #[test]
     fn recover_ignores_an_entry_that_is_still_locked() {
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let inner = track.track();
         let slot = &inner.slots[0];
 
@@ -797,7 +1045,7 @@ mod tests {
 
     #[test]
     fn wait_for_validates_ids_times_out_and_wakes_on_enter() {
-        let track = AtomicTrackWaiting::new(4);
+        let track = AtomicTrackWaiting::new_default(4);
 
         assert_eq!(track.wait_for_timeout(EMPTY_ID, 0), Err(WaitError::InvalidId));
         assert_eq!(track.wait_for_timeout(MSB, 0), Err(WaitError::InvalidId));
@@ -821,7 +1069,7 @@ mod tests {
 
     #[test]
     fn blocking_entry_waits_wake_on_enter() {
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let barrier = Arc::new(Barrier::new(3));
 
         let id_waiter_track = track.clone();
@@ -865,7 +1113,7 @@ mod tests {
 
     #[test]
     fn key_wait_is_woken_when_the_number_advances() {
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let number_id = track.enter(9).unwrap();
         let waiter_track = track.clone();
         let barrier = Arc::new(Barrier::new(2));
@@ -884,7 +1132,7 @@ mod tests {
 
     #[test]
     fn raise_to_wakes_blocking_key_and_number_waits() {
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let number_id = track.enter(9).unwrap();
         let barrier = Arc::new(Barrier::new(3));
 
@@ -927,7 +1175,7 @@ mod tests {
 
     #[test]
     fn number_wait_is_woken_when_the_lane_leaves() {
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let number_id = track.enter(11).unwrap();
         let waiter_track = track.clone();
         let barrier = Arc::new(Barrier::new(2));
@@ -947,7 +1195,7 @@ mod tests {
 
     #[test]
     fn concurrent_leave_wakes_a_blocking_number_wait() {
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let number_id = track.enter(11).unwrap();
         let waiter_track = track.clone();
         let barrier = Arc::new(Barrier::new(2));
@@ -974,7 +1222,7 @@ mod tests {
 
     #[test]
     fn manual_atomic_update_wakes_after_signal_change() {
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let number_id = track.enter(15).unwrap();
         let waiter_track = track.clone();
         let barrier = Arc::new(Barrier::new(2));
@@ -1005,7 +1253,7 @@ mod tests {
 
     #[test]
     fn timed_waits_return_the_last_observed_value() {
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let number_id = track.enter_from(13, 3).unwrap();
 
         assert_eq!(
@@ -1024,7 +1272,7 @@ mod tests {
         const MIN_ALLOWED: Duration = Duration::from_nanos(TIMEOUT_NS);
         const MAX_ALLOWED: Duration = Duration::from_millis(500);
 
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let number_id = track.enter(1).unwrap();
 
         let (result, elapsed) = run_while_futex_is_hot(
@@ -1055,7 +1303,7 @@ mod tests {
 
     #[test]
     fn key_wait_uses_only_the_first_recovered_placement() {
-        let track = AtomicTrackWaiting::new(4);
+        let track = AtomicTrackWaiting::new_default(4);
         let hole = track.enter(1).unwrap();
         let later = track.enter(5).unwrap();
         track.number(later).unwrap().raise_to(22).unwrap();
@@ -1074,7 +1322,7 @@ mod tests {
 
     #[test]
     fn threshold_waits_compare_values_across_wrap() {
-        let track = AtomicTrackWaiting::new(1);
+        let track = AtomicTrackWaiting::new_default(1);
         let number_id = track.enter(17).unwrap();
         let number = track.number(number_id).unwrap();
         let quarter = NumericType::MAX / 4;
