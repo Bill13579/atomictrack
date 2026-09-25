@@ -200,7 +200,8 @@ pub struct AtomicTrackWaiting<
     const USER_BIT_LOW: u32 = { NumericType::BITS },
     const USER_BITS_DEFAULT: NumericType = 0,
 > {
-    shared: NonNull<Shared<USER_BIT_LOW, USER_BITS_DEFAULT>>,
+    track: NonNull<AtomicTrack<[CachePadded<Slot>], USER_BIT_LOW, USER_BITS_DEFAULT>>,
+    shared: Option<NonNull<Shared<USER_BIT_LOW, USER_BITS_DEFAULT>>>,
 }
 
 unsafe impl<const L: u32, const I: NumericType> Send for AtomicTrackWaiting<L, I> {}
@@ -232,17 +233,22 @@ pub struct NumberWaiting<
 
 impl<const L: u32, const I: NumericType> Clone for AtomicTrackWaiting<L, I> {
     fn clone(&self) -> Self {
-        self.shared().handle_count.fetch_add(1, Ordering::Relaxed);
-        Self { shared: self.shared }
+        if let Some(shared) = self.shared {
+            unsafe { shared.as_ref() }.handle_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Self { track: self.track, shared: self.shared }
     }
 }
 
 impl<const L: u32, const I: NumericType> Drop for AtomicTrackWaiting<L, I> {
     fn drop(&mut self) {
-        if self.shared().handle_count.fetch_sub(1, Ordering::Release) == 1 {
+        let Some(shared) = self.shared else {
+            return;
+        };
+        if unsafe { shared.as_ref() }.handle_count.fetch_sub(1, Ordering::Release) == 1 {
             core::sync::atomic::fence(Ordering::Acquire);
             let layout = shared_layout(self.track().capacity());
-            unsafe { std::alloc::dealloc(self.shared.as_ptr().cast::<u8>(), layout) };
+            unsafe { std::alloc::dealloc(shared.as_ptr().cast::<u8>(), layout) };
         }
     }
 }
@@ -265,19 +271,30 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             };
             let shared = ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast::<CachePadded<Slot>>(), capacity) as *mut Shared<L, I>;
             (&raw mut (*shared).handle_count).write(AtomicUsize::new(1));
-            AtomicTrack::<[CachePadded<Slot>], L, I>::init_in_place(NonNull::new_unchecked((&raw mut (*shared).track).cast::<u8>()), capacity);
-            Self { shared: NonNull::new_unchecked(shared) }
+            let track = &raw mut (*shared).track;
+            AtomicTrack::<[CachePadded<Slot>], L, I>::init_in_place(NonNull::new_unchecked(track.cast::<u8>()), capacity);
+            Self { track: NonNull::new_unchecked(track), shared: Some(NonNull::new_unchecked(shared)) }
         }
     }
 
-    #[inline]
-    fn shared(&self) -> &Shared<L, I> {
-        unsafe { self.shared.as_ref() }
+    /// Wraps a track that is already initialized (for example, one placed in shared memory with [`AtomicTrack::init_in_place`] and reopened elsewhere with [`AtomicTrack::from_raw`]).
+    /// The handle, and its clones, never free the track.
+    ///
+    /// # Safety
+    /// `track` must point to an initialized track that stays valid (mapped, never freed, never moved) for as long as this handle,
+    /// any clone of it, and any [`NumberWaiting`] or ongoing wait derived from them exist.
+    pub unsafe fn from_raw(track: NonNull<AtomicTrack<[CachePadded<Slot>], L, I>>) -> Self {
+        Self { track, shared: None }
+    }
+
+    /// Wraps a track that stays valid for the rest of the program, such as one in a shared memory mapping that is never unmapped. See [`from_raw`](`AtomicTrackWaiting::from_raw`).
+    pub fn from_static(track: &'static AtomicTrack<[CachePadded<Slot>], L, I>) -> Self {
+        unsafe { Self::from_raw(NonNull::from(track)) }
     }
 
     #[inline]
     fn track(&self) -> &AtomicTrack<[CachePadded<Slot>], L, I> {
-        &self.shared().track
+        unsafe { self.track.as_ref() }
     }
 
     pub fn capacity(&self) -> usize {
@@ -1012,6 +1029,91 @@ mod tests {
 
             std::alloc::dealloc(first.as_ptr(), layout);
             std::alloc::dealloc(second.as_ptr(), layout);
+        }
+    }
+
+    static STATIC_TRACK: crate::ArrayAtomicTrack<4> = crate::ArrayAtomicTrack::new();
+
+    #[test]
+    fn from_static_handles_share_the_track_and_wake_each_other() {
+        let track: &'static AtomicTrack = &STATIC_TRACK;
+        let handle = AtomicTrackWaiting::from_static(track);
+        let number_id = handle.enter(21).unwrap();
+        let waiter_handle = handle.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let waiter = thread::spawn(move || {
+            sender.send(waiter_handle.number(number_id).unwrap().wait_gte(4)).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        AtomicTrackWaiting::from_static(track).number(number_id).unwrap().raise_to(4).unwrap();
+        assert_eq!(receiver.recv_timeout(TEST_WATCHDOG).expect("from_static wait did not wake"), Ok(4));
+        waiter.join().unwrap();
+
+        drop(handle);
+        assert_eq!(track.number(number_id).unwrap().get(), Ok(4));
+        track.leave(number_id).unwrap();
+    }
+
+    #[test]
+    fn from_raw_handles_never_free_the_track() {
+        let layout = AtomicTrack::layout(4).unwrap();
+        unsafe {
+            let memory = NonNull::new(std::alloc::alloc(layout)).unwrap();
+            let track = NonNull::from(AtomicTrack::init_in_place_default(memory, 4));
+            let handle = AtomicTrackWaiting::from_raw(track);
+            let clones = [handle.clone(), handle.clone()];
+            let number_id = handle.enter(9).unwrap();
+            clones[0].number(number_id).unwrap().add(3).unwrap();
+            drop(clones);
+            drop(handle);
+
+            assert_eq!(track.as_ref().number(number_id).unwrap().get(), Ok(3));
+            std::alloc::dealloc(memory.as_ptr(), layout);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn from_raw_handles_on_two_mappings_of_one_track_wake_each_other() {
+        use core::ffi::c_void;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileMappingW(file: *mut c_void, attributes: *const c_void, protect: u32, size_high: u32, size_low: u32, name: *const u16) -> *mut c_void;
+            fn MapViewOfFile(mapping: *mut c_void, access: u32, offset_high: u32, offset_low: u32, bytes: usize) -> *mut c_void;
+            fn UnmapViewOfFile(base: *const c_void) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+
+        let layout = AtomicTrack::layout(4).unwrap();
+        unsafe {
+            let mapping = CreateFileMappingW(ptr::without_provenance_mut(usize::MAX), ptr::null(), 0x04, 0, layout.size() as u32, ptr::null());
+            assert!(!mapping.is_null());
+            let view_a = NonNull::new(MapViewOfFile(mapping, 0xF001F, 0, 0, layout.size()).cast::<u8>()).unwrap();
+            let view_b = NonNull::new(MapViewOfFile(mapping, 0xF001F, 0, 0, layout.size()).cast::<u8>()).unwrap();
+            assert_ne!(view_a, view_b);
+
+            let track_a = NonNull::from(AtomicTrack::init_in_place_default(view_a, 4));
+            let track_b = NonNull::from(AtomicTrack::from_raw_default(view_b, 4));
+            let handle_a = AtomicTrackWaiting::from_raw(track_a);
+            let handle_b = AtomicTrackWaiting::from_raw(track_b);
+
+            let number_id = handle_a.enter(33).unwrap();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let waiter = thread::spawn(move || {
+                sender.send(handle_b.number(number_id).unwrap().wait_gte(6)).unwrap();
+            });
+
+            thread::sleep(Duration::from_millis(10));
+            handle_a.number(number_id).unwrap().raise_to(6).unwrap();
+            assert_eq!(receiver.recv_timeout(TEST_WATCHDOG).expect("wait through the other mapping did not wake"), Ok(6));
+            waiter.join().unwrap();
+            drop(handle_a);
+
+            UnmapViewOfFile(view_a.as_ptr().cast());
+            UnmapViewOfFile(view_b.as_ptr().cast());
+            CloseHandle(mapping);
         }
     }
 
