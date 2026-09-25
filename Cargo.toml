@@ -24,3 +24,7 @@ capi = []  # marker feature for whether to export A_T_* public C ABI exports
 features = ["waiting"]
 
 [dependencies]
+
+[[example]]
+name = "two_process"
+required-features = ["waiting"]
