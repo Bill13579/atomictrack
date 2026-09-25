@@ -20,11 +20,26 @@
 //! Waits may return spuriously, including when interrupted by a Unix signal, so
 //! always re-check the condition.
 //!
+//! When `pinfo` is not zero, it is a packed value consisting of:
+//! - `upper bits`: u64 value which uniquely identifies the waiting (atomics) pool
+//!   that the atomic belongs to *across processes* (any unique and shared random number will do), and
+//! - `lower bits`: u64 value representing the *base address* where the first atomic
+//!   in that pool is mapped *within this process*. So `*const AtomicU32 - pinfo_lower_bits = offset of the atomic within the waiting pool it belongs to`.
+//!
+//! This value, should it be non-zero, will then be used to correlate and enable cross-process waiting
+//! on Windows. On every other platform, the exact value of `pinfo` does not matter, but if possible, still try to provide the value as described.
+//! Private atomic waits that need not be cross-process can have `pinfo` set to `0`, which will do a regular private futex wait/wake.
+//!
 //! # Platform notes
 //!
 //! - Windows requires Windows 8 / Server 2012 or newer. Finite nanosecond
 //!   timeouts are rounded up to milliseconds and capped at `u32::MAX - 1`
 //!   milliseconds (`u32::MAX` means infinite to `WaitOnAddress`).
+//! - On Windows, a non-zero `pinfo` requires the `std` feature (it panics otherwise). Each atomic gets a named
+//!   manual-reset event `Local\{pool:016x}futex{offset / 4}`, opened lazily and cached for the life of the process,
+//!   so processes must be in the same session to see each other. Waits sleep in time slices of `ATOMICTRACK_WIN_SHARED_WAIT_TIME_SLICE_MS` milliseconds
+//!   (default 20, rounded up to the system timer tick). The atomic is rechecked between each time slice, so the
+//!   maximum latency from a missed wake is capped. Every `wake_all` with a non-zero `pinfo` uses two system calls, even with no waiters.
 //! - macOS uses the private `__ulock_wait2` API. This can make an application
 //!   unsuitable for App Store distribution. `__ulock_wait2` is available on
 //!   macOS 10.15 and newer.
@@ -46,9 +61,9 @@ pub fn wait(atomic: &AtomicU32, expected: u32, pinfo: u128) {
 
 /// Wait while `atomic` equals `expected`, for at most `timeout_ns` nanoseconds.
 ///
-/// Returns `false` only when the operating system reports that the timeout
-/// elapsed. Returns `true` after a wake, a value mismatch, an interruption, or
-/// another spurious return. Re-check the atomic value in any case.
+/// Returns `false` only when the timeout has elapsed.
+/// Returns `true` after a wake, a value mismatch, an interruption, or
+/// another spurious return. Make sure to re-check the atomic value in any case.
 ///
 /// A timeout of zero does not block. On Windows, positive values are rounded
 /// up to the next whole millisecond, while other platforms retain nanosecond input.
@@ -110,7 +125,10 @@ mod imp {
         fn WakeByAddressAll(address: *const c_void);
     }
 
-    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>, _pinfo: u128) -> bool {
+    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>, pinfo: u128) -> bool {
+        if pinfo != 0 {
+            return shared::wait(atomic, expected, timeout_ns, pinfo);
+        }
         const INFINITE: u32 = u32::MAX;
         let timeout_ms = timeout_ns.map_or(INFINITE, |ns| {
             ns.div_ceil(1_000_000).min((INFINITE - 1) as u64) as u32
@@ -125,7 +143,11 @@ mod imp {
         }
     }
 
-    pub(super) fn wake(atomic: &AtomicU32, all: bool, _pinfo: u128) -> Option<u32> {
+    pub(super) fn wake(atomic: &AtomicU32, all: bool, pinfo: u128) -> Option<u32> {
+        if pinfo != 0 {
+            shared::wake(atomic, pinfo);
+            return None;
+        }
         let address = atomic as *const AtomicU32 as *const c_void;
         unsafe {
             if all {
@@ -135,6 +157,123 @@ mod imp {
             }
         }
         None
+    }
+
+    #[cfg(not(feature = "std"))]
+    mod shared {
+        use super::AtomicU32;
+
+        pub(super) fn wait(_atomic: &AtomicU32, _expected: u32, _timeout_ns: Option<u64>, _pinfo: u128) -> bool {
+            panic!("cross-process waiting (waiting with non-zero pinfo) on Windows requires the `std` feature");
+        }
+
+        pub(super) fn wake(_atomic: &AtomicU32, _pinfo: u128) {
+            panic!("cross-process waiting (waiting with non-zero pinfo) on Windows requires the `std` feature");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) mod shared {
+        extern crate std;
+
+        use super::AtomicU32;
+        use core::{ffi::c_void, ptr, sync::atomic::Ordering};
+        use std::{
+            collections::{BTreeMap, btree_map::Entry},
+            format,
+            sync::{PoisonError, RwLock},
+            thread,
+            time::{Duration, Instant},
+            vec::Vec,
+        };
+
+        const WAIT_SLICE_MS: u32 = crate::env_or_default!("ATOMICTRACK_WIN_SHARED_WAIT_TIME_SLICE_MS", "20", u32);
+        const _: () = assert!(WAIT_SLICE_MS > 0 && WAIT_SLICE_MS < u32::MAX, "ATOMICTRACK_WIN_SHARED_WAIT_TIME_SLICE_MS should be within range 1..u32::MAX");
+
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT: u32 = 0x102;
+
+        #[cfg_attr(
+            target_arch = "x86",
+            link(name = "kernel32", kind = "raw-dylib", import_name_type = "undecorated")
+        )]
+        #[cfg_attr(not(target_arch = "x86"), link(name = "kernel32", kind = "raw-dylib"))]
+        unsafe extern "system" {
+            fn CreateEventW(attributes: *const c_void, manual_reset: i32, initial_state: i32, name: *const u16) -> *mut c_void;
+            fn SetEvent(event: *mut c_void) -> i32;
+            fn ResetEvent(event: *mut c_void) -> i32;
+            fn WaitForSingleObject(handle: *mut c_void, timeout_ms: u32) -> u32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+
+        /// Manual reset events
+        static EVENTS: RwLock<BTreeMap<(u64, u64), usize>> = RwLock::new(BTreeMap::new());
+
+        pub(crate) fn key(atomic: &AtomicU32, pinfo: u128) -> (u64, u64) {
+            let base = pinfo as u64;
+            let address = (atomic as *const AtomicU32).addr() as u64;
+            debug_assert!(address >= base, "the atomic must be *at* or *after* the base address specified in pinfo");
+            ((pinfo >> 64) as u64, address.wrapping_sub(base) / size_of::<AtomicU32>() as u64)
+        }
+
+        pub(crate) fn name((pool, index): (u64, u64)) -> Vec<u16> {
+            format!("Local\\{pool:016x}futex{index}").encode_utf16().chain([0]).collect()
+        }
+
+        fn event(key: (u64, u64)) -> Option<*mut c_void> {
+            if let Some(&handle) = EVENTS.read().unwrap_or_else(PoisonError::into_inner).get(&key) {
+                return Some(ptr::with_exposed_provenance_mut(handle));
+            }
+            let name = name(key);
+            let created = unsafe { CreateEventW(ptr::null(), 1, 0, name.as_ptr()) };
+            if created.is_null() {
+                return None;
+            }
+            match EVENTS.write().unwrap_or_else(PoisonError::into_inner).entry(key) {
+                Entry::Occupied(existing) => {
+                    unsafe { CloseHandle(created) };
+                    Some(ptr::with_exposed_provenance_mut(*existing.get()))
+                },
+                Entry::Vacant(slot) => {
+                    slot.insert(created.expose_provenance());
+                    Some(created)
+                },
+            }
+        }
+
+        pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>, pinfo: u128) -> bool {
+            let event = event(key(atomic, pinfo));
+            let deadline = timeout_ns.and_then(|ns| Instant::now().checked_add(Duration::from_nanos(ns)));
+            loop {
+                if atomic.load(Ordering::Acquire) != expected {
+                    return true;
+                }
+                let time_slice_ms = match deadline {
+                    None => WAIT_SLICE_MS,
+                    Some(deadline) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            return false;
+                        }
+                        remaining.as_nanos().div_ceil(1_000_000).min(WAIT_SLICE_MS as u128) as u32
+                    },
+                };
+                match event.map(|event| unsafe { WaitForSingleObject(event, time_slice_ms) }) {
+                    Some(WAIT_OBJECT_0) => return true,
+                    Some(WAIT_TIMEOUT) => {},
+                    _ => thread::sleep(Duration::from_millis(time_slice_ms as u64)),
+                }
+            }
+        }
+
+        pub(super) fn wake(atomic: &AtomicU32, pinfo: u128) {
+            if let Some(event) = event(key(atomic, pinfo)) {
+                unsafe {
+                    SetEvent(event);
+                    ResetEvent(event);
+                }
+            }
+        }
     }
 }
 
@@ -474,6 +613,140 @@ mod tests {
     fn shared_wake_all_releases_or_races_with_shared_waiter() {
         wake_releases_or_races_with_waiter(1, |atomic| wake_all(atomic, 1));
         wake_releases_or_races_with_waiter(u128::MAX, |atomic| wake_all(atomic, u128::MAX));
+    }
+
+    #[cfg(all(target_os = "windows", feature = "std"))]
+    mod windows_shared {
+        use super::*;
+        use core::ffi::c_void;
+        use std::{sync::mpsc, time::{Duration, Instant}};
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileMappingW(file: *mut c_void, attributes: *const c_void, protect: u32, size_high: u32, size_low: u32, name: *const u16) -> *mut c_void;
+            fn MapViewOfFile(mapping: *mut c_void, access: u32, offset_high: u32, offset_low: u32, bytes: usize) -> *mut c_void;
+            fn UnmapViewOfFile(base: *const c_void) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+
+        const PAGE_READWRITE: u32 = 0x04;
+        const FILE_MAP_ALL_ACCESS: u32 = 0xF001F;
+        const SIZE: usize = 4096;
+
+        struct TwoViews {
+            mapping: *mut c_void,
+            a: usize,
+            b: usize,
+            pool: u64,
+        }
+
+        impl TwoViews {
+            fn new(test: u64) -> Self {
+                unsafe {
+                    let mapping = CreateFileMappingW(ptr::without_provenance_mut(usize::MAX), ptr::null(), PAGE_READWRITE, 0, SIZE as u32, ptr::null());
+                    assert!(!mapping.is_null());
+                    let a = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, SIZE);
+                    let b = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, SIZE);
+                    assert!(!a.is_null() && !b.is_null() && a != b);
+                    Self {
+                        mapping,
+                        a: a.expose_provenance(),
+                        b: b.expose_provenance(),
+                        pool: ((std::process::id() as u64) << 32) | test,
+                    }
+                }
+            }
+
+            fn pinfo_a(&self) -> u128 {
+                ((self.pool as u128) << 64) | self.a as u128
+            }
+
+            fn pinfo_b(&self) -> u128 {
+                ((self.pool as u128) << 64) | self.b as u128
+            }
+
+            fn atomic_a(&self, offset: usize) -> &'static AtomicU32 {
+                unsafe { &*ptr::with_exposed_provenance::<AtomicU32>(self.a + offset) }
+            }
+
+            fn atomic_b(&self, offset: usize) -> &'static AtomicU32 {
+                unsafe { &*ptr::with_exposed_provenance::<AtomicU32>(self.b + offset) }
+            }
+        }
+
+        impl Drop for TwoViews {
+            fn drop(&mut self) {
+                unsafe {
+                    UnmapViewOfFile(ptr::with_exposed_provenance(self.a));
+                    UnmapViewOfFile(ptr::with_exposed_provenance(self.b));
+                    CloseHandle(self.mapping);
+                }
+            }
+        }
+
+        use core::ptr;
+        use super::super::imp::shared::{key, name};
+
+        #[test]
+        fn views_agree_on_the_event_and_pools_do_not() {
+            let views = TwoViews::new(1);
+            let a = views.atomic_a(8);
+            let b = views.atomic_b(8);
+            b.store(42, Ordering::Release);
+            assert_eq!(a.load(Ordering::Acquire), 42);
+
+            assert_eq!(key(a, views.pinfo_a()), (views.pool, 2));
+            assert_eq!(key(a, views.pinfo_a()), key(b, views.pinfo_b()));
+            assert_ne!(key(a, views.pinfo_a()), key(views.atomic_a(12), views.pinfo_a()));
+            assert_ne!(key(a, views.pinfo_a()), key(b, views.pinfo_b() ^ (1 << 64)));
+
+            let expected: std::vec::Vec<u16> = std::format!("Local\\{:016x}futex2", views.pool).encode_utf16().chain([0]).collect();
+            assert_eq!(name(key(a, views.pinfo_a())), expected);
+        }
+
+        #[test]
+        fn wake_through_another_view_releases_a_blocking_wait_without_a_value_change() {
+            let views = TwoViews::new(2);
+            let (a, pinfo_a) = (views.atomic_a(16), views.pinfo_a());
+            let (b, pinfo_b) = (views.atomic_b(16), views.pinfo_b());
+            let (sender, receiver) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                wait(a, 0, pinfo_a);
+                sender.send(()).unwrap();
+            });
+
+            thread::sleep(Duration::from_millis(50));
+            let started = Instant::now();
+            while receiver.try_recv().is_err() {
+                assert!(started.elapsed() < Duration::from_secs(5), "shared wait was never released by a wake");
+                let _ = wake_all(b, pinfo_b);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(a.load(Ordering::Acquire), 0);
+            worker.join().unwrap();
+        }
+
+        #[test]
+        fn shared_wait_times_out_and_notices_unsignaled_changes() {
+            let views = TwoViews::new(3);
+            let (a, pinfo_a) = (views.atomic_a(0), views.pinfo_a());
+            let b = views.atomic_b(0);
+
+            let started = Instant::now();
+            assert!(!wait_timeout(a, 0, 50_000_000, pinfo_a));
+            assert!(started.elapsed() >= Duration::from_millis(50));
+            assert!(wait_timeout(a, 1, 50_000_000, pinfo_a));
+
+            let worker = thread::spawn(move || {
+                let started = Instant::now();
+                (wait_timeout(a, 0, 5_000_000_000, pinfo_a), started.elapsed())
+            });
+            thread::sleep(Duration::from_millis(30));
+            b.store(1, Ordering::Release);
+            let (woke, elapsed) = worker.join().unwrap();
+            assert!(woke);
+            assert!(elapsed < Duration::from_secs(1), "missed change took {elapsed:?}");
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
