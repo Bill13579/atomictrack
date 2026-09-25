@@ -16,7 +16,7 @@ extern crate std;
 #[cfg(feature = "std")]
 use std::time::Instant;
 
-use core::{alloc::Layout, hash::{Hash, Hasher}, ptr::{self, NonNull}, sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering}};
+use core::{alloc::Layout, hash::Hasher, ptr::{self, NonNull}, sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering}};
 
 #[cfg(feature = "std")]
 use std::boxed::Box;
@@ -156,10 +156,11 @@ fn futex(i: usize) -> (&'static AtomicU32, u128) {
     (&futexes.s[i & (futexes.s.len() - 1)], futexes.pinfo())
 }
 
-fn get_futex<T: ?Sized>(a: &T, b: NumericType) -> (&'static AtomicU32, u128) {
+fn get_futex<const L: u32, const I: NumericType>(track: &AtomicTrack<[CachePadded<Slot>], L, I>, id: NumericType) -> (&'static AtomicU32, u128) {
     let mut hasher = hasher::RhmHasher::default();
-    (a as *const T).addr().hash(&mut hasher);
-    b.hash(&mut hasher);
+    hasher.write(&track.seed().to_le_bytes());
+    #[allow(clippy::unnecessary_cast)]
+    hasher.write(&(id as u64).to_le_bytes());
     futex(hasher.finish() as usize)
 }
 
@@ -935,7 +936,10 @@ mod tests {
         number.wait_spurious(number_word);
         assert!(started.elapsed() < Duration::from_millis(500));
 
-        assert!((0..5).any(|_| !number.wait_spurious_timeout(number.futex_word_value(), 1_000_000)));
+        let started = Instant::now();
+        while number.wait_spurious_timeout(number.futex_word_value(), 1_000_000) {
+            assert!(started.elapsed() < TEST_WATCHDOG, "a fresh load never led to a timed out wait");
+        }
     }
 
     #[test]
@@ -982,6 +986,33 @@ mod tests {
         let (word, pinfo) = get_futex(track.track(), 5);
         assert_eq!(pinfo, futexes().pinfo());
         assert!(futexes().s.as_ptr_range().contains(&ptr::from_ref(word)));
+    }
+
+    #[test]
+    fn get_futex_follows_the_seed_not_the_mapping() {
+        let layout = AtomicTrack::layout(4).unwrap();
+        unsafe {
+            let first = NonNull::new(std::alloc::alloc(layout)).unwrap();
+            let second = NonNull::new(std::alloc::alloc(layout)).unwrap();
+            let track = AtomicTrack::init_in_place_default(first, 4);
+            ptr::copy_nonoverlapping(first.as_ptr(), second.as_ptr(), layout.size());
+            let elsewhere = AtomicTrack::from_raw_default(second, 4);
+
+            for id in [1, 2, 3, 77, id_of("renderer")] {
+                let (word, pinfo) = get_futex(track, id);
+                let (word_elsewhere, pinfo_elsewhere) = get_futex(elsewhere, id);
+                assert!(ptr::eq(word, word_elsewhere), "id {id}");
+                assert_eq!(pinfo, pinfo_elsewhere);
+            }
+
+            let mut hasher = hasher::RhmHasher::default();
+            hasher.write(&(first.as_ptr().addr() as u64).to_le_bytes());
+            hasher.write(&77u64.to_le_bytes());
+            assert!(ptr::eq(get_futex(elsewhere, 77).0, futex(hasher.finish() as usize).0));
+
+            std::alloc::dealloc(first.as_ptr(), layout);
+            std::alloc::dealloc(second.as_ptr(), layout);
+        }
     }
 
     #[test]

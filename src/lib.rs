@@ -129,6 +129,7 @@ pub struct AtomicTrack<
     const USER_BIT_LOW: u32 = { NumericType::BITS },
     const USER_BITS_DEFAULT: NumericType = 0,
 > {
+    seed: u64,
     min: CachePadded<AtomicType>,
     slots: S,
 }
@@ -202,6 +203,19 @@ impl<S: ?Sized, const L: u32, const I: NumericType> AtomicTrack<S, L, I> {
         assert!(is_valid_user_bit_low(L), "USER_BIT_LOW should be within range 3..=NumericType::BITS");
         assert!(I & !user_mask(L) == 0, "USER_BITS_DEFAULT must only use the user bits");
     };
+
+    /// The address the track was initialized at through [`init_in_place`](`AtomicTrack::init_in_place`),
+    /// used as a seed to disperse futexes in different tracks (set once initially, and then stays the same value with subsequent processes that map it).
+    /// Or for tracks made through [`ArrayAtomicTrack::new`], always the current address, since using that constructor implies private memory.
+    #[cfg_attr(not(feature = "waiting"), allow(dead_code))]
+    #[inline]
+    pub(crate) fn seed(&self) -> u64 {
+        if self.seed == 0 {
+            (self as *const Self).addr() as u64
+        } else {
+            self.seed
+        }
+    }
 }
 
 impl<const N: usize, const L: u32, const I: NumericType> ArrayAtomicTrack<N, L, I> {
@@ -209,6 +223,7 @@ impl<const N: usize, const L: u32, const I: NumericType> ArrayAtomicTrack<N, L, 
         const { assert!(N.is_power_of_two(), "capacity must be a power of two") };
         let () = Self::VALID;
         Self {
+            seed: 0,
             min: CachePadded::new(AtomicType::new(0)),
             slots: [const { CachePadded::new(Slot::new()) }; N],
         }
@@ -235,7 +250,8 @@ impl AtomicTrack {
             return None;
         }
         let slots = Layout::array::<CachePadded<Slot>>(capacity).ok()?;
-        let (layout, _) = Layout::new::<CachePadded<AtomicType>>().extend(slots).ok()?;
+        let (header, _) = Layout::new::<u64>().extend(Layout::new::<CachePadded<AtomicType>>()).ok()?;
+        let (layout, _) = header.extend(slots).ok()?;
         Some(layout.pad_to_align())
     }
 
@@ -267,6 +283,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
         );
         let track = ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast::<CachePadded<Slot>>(), capacity) as *mut Self;
         unsafe {
+            (&raw mut (*track).seed).write(ptr.as_ptr().addr() as u64);
             (&raw mut (*track).min).write(CachePadded::new(AtomicType::new(0)));
             let slots = (&raw mut (*track).slots).cast::<CachePadded<Slot>>();
             for i in 0..capacity {
@@ -877,6 +894,29 @@ mod tests {
             assert_eq!(track.min(), 9);
 
             std::alloc::dealloc(ptr.as_ptr(), layout);
+        }
+    }
+
+    #[test]
+    fn seed_is_the_birth_address_and_survives_being_seen_elsewhere() {
+        let array = ArrayAtomicTrack::<2>::new();
+        let array_track: &AtomicTrack = &array;
+        assert_eq!(array_track.seed(), (array_track as *const AtomicTrack).addr() as u64);
+
+        let layout = AtomicTrack::layout(2).unwrap();
+        unsafe {
+            let first = NonNull::new(std::alloc::alloc(layout)).unwrap();
+            let second = NonNull::new(std::alloc::alloc(layout)).unwrap();
+            let track = AtomicTrack::init_in_place_default(first, 2);
+            assert_eq!(track.seed(), first.as_ptr().addr() as u64);
+            assert_eq!(AtomicTrack::from_raw_default(first, 2).seed(), track.seed());
+
+            ptr::copy_nonoverlapping(first.as_ptr(), second.as_ptr(), layout.size());
+            let elsewhere = AtomicTrack::from_raw_default(second, 2);
+            assert_eq!(elsewhere.seed(), first.as_ptr().addr() as u64);
+
+            std::alloc::dealloc(first.as_ptr(), layout);
+            std::alloc::dealloc(second.as_ptr(), layout);
         }
     }
 
