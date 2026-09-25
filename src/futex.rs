@@ -4,7 +4,7 @@
 // Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
 // or the MIT license (http://opensource.org).
 
-//! Small, dependency-free, process-private atomic wait/wake helpers.
+//! Small, dependency-free atomic wait/wake helper module.
 //!
 //! This module uses [`AtomicU32`] because 32 bits is the widest size supported
 //! natively by every backend here. In particular, traditional Linux futexes,
@@ -18,7 +18,7 @@
 //! [`Ordering::Acquire`] in a loop.
 //!
 //! Waits may return spuriously, including when interrupted by a Unix signal, so
-//! always re-check the condition. All waits and wakes are process-private.
+//! always re-check the condition.
 //!
 //! # Platform notes
 //!
@@ -35,54 +35,51 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Wait while `atomic` equals `expected`.
 ///
-/// Returns immediately if the value is already different. This is a raw,
-/// possibly-spurious wait: re-check the condition after it returns.
+/// Returns immediately if the value is already different.
 #[inline]
-pub fn wait(atomic: &AtomicU32, expected: u32) {
+pub fn wait(atomic: &AtomicU32, expected: u32, pinfo: u128) {
     if atomic.load(Ordering::Relaxed) != expected {
         return;
     }
-    let _ = imp::wait(atomic, expected, None);
+    let _ = imp::wait(atomic, expected, None, pinfo);
 }
 
 /// Wait while `atomic` equals `expected`, for at most `timeout_ns` nanoseconds.
 ///
 /// Returns `false` only when the operating system reports that the timeout
 /// elapsed. Returns `true` after a wake, a value mismatch, an interruption, or
-/// another spurious return. Re-check the atomic value in either case.
+/// another spurious return. Re-check the atomic value in any case.
 ///
 /// A timeout of zero does not block. On Windows, positive values are rounded
-/// up to the next whole millisecond; other platforms retain nanosecond input.
+/// up to the next whole millisecond, while other platforms retain nanosecond input.
 #[inline]
 #[must_use]
-pub fn wait_timeout(atomic: &AtomicU32, expected: u32, timeout_ns: u64) -> bool {
+pub fn wait_timeout(atomic: &AtomicU32, expected: u32, timeout_ns: u64, pinfo: u128) -> bool {
     if atomic.load(Ordering::Relaxed) != expected {
         return true;
     }
     if timeout_ns == 0 {
         return false;
     }
-    imp::wait(atomic, expected, Some(timeout_ns))
+    imp::wait(atomic, expected, Some(timeout_ns), pinfo)
 }
 
 /// Wake at most one waiter sleeping on `atomic`.
 ///
-/// Returns `Some(number_woken)` on Linux and Wasm. Returns `None` where the
-/// platform API does not report a reliable count (Windows, macOS, FreeBSD).
+/// Returns `Some(number_woken)` on Linux and Wasm, and `None` elsewhere.
 #[inline]
 #[must_use]
 pub fn wake_one(atomic: &AtomicU32) -> Option<u32> {
-    imp::wake(atomic, false)
+    imp::wake(atomic, false, 0)
 }
 
 /// Wake all waiters sleeping on `atomic`.
 ///
-/// Returns `Some(number_woken)` on Linux and Wasm. Returns `None` where the
-/// platform API does not report a reliable count (Windows, macOS, FreeBSD).
+/// Returns `Some(number_woken)` on Linux and Wasm, and `None` elsewhere.
 #[inline]
 #[must_use]
-pub fn wake_all(atomic: &AtomicU32) -> Option<u32> {
-    imp::wake(atomic, true)
+pub fn wake_all(atomic: &AtomicU32, pinfo: u128) -> Option<u32> {
+    imp::wake(atomic, true, pinfo)
 }
 
 #[cfg(target_os = "windows")]
@@ -113,7 +110,7 @@ mod imp {
         fn WakeByAddressAll(address: *const c_void);
     }
 
-    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>) -> bool {
+    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>, _pinfo: u128) -> bool {
         const INFINITE: u32 = u32::MAX;
         let timeout_ms = timeout_ns.map_or(INFINITE, |ns| {
             ns.div_ceil(1_000_000).min((INFINITE - 1) as u64) as u32
@@ -128,7 +125,7 @@ mod imp {
         }
     }
 
-    pub(super) fn wake(atomic: &AtomicU32, all: bool) -> Option<u32> {
+    pub(super) fn wake(atomic: &AtomicU32, all: bool, _pinfo: u128) -> Option<u32> {
         let address = atomic as *const AtomicU32 as *const c_void;
         unsafe {
             if all {
@@ -204,7 +201,11 @@ mod imp {
         }
     }
 
-    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>) -> bool {
+    const fn private_flag(pinfo: u128) -> i32 {
+        if pinfo == 0 { FUTEX_PRIVATE_FLAG } else { 0 }
+    }
+
+    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>, pinfo: u128) -> bool {
         let timeout = timeout_ns.map(relative_timespec);
         let timeout_ptr = timeout
             .as_ref()
@@ -213,7 +214,7 @@ mod imp {
             syscall(
                 SYS_FUTEX,
                 atomic as *const AtomicU32,
-                FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+                FUTEX_WAIT | private_flag(pinfo),
                 expected,
                 timeout_ptr,
                 ptr::null::<c_void>(),
@@ -223,13 +224,13 @@ mod imp {
         result >= 0 || unsafe { *__errno_location() } != ETIMEDOUT
     }
 
-    pub(super) fn wake(atomic: &AtomicU32, all: bool) -> Option<u32> {
+    pub(super) fn wake(atomic: &AtomicU32, all: bool, pinfo: u128) -> Option<u32> {
         let count = if all { i32::MAX } else { 1 };
         let result = unsafe {
             syscall(
                 SYS_FUTEX,
                 atomic as *const AtomicU32,
-                FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                FUTEX_WAKE | private_flag(pinfo),
                 count,
             )
         };
@@ -249,6 +250,7 @@ mod imp {
     use core::ffi::c_void;
 
     const UL_COMPARE_AND_WAIT: u32 = 1;
+    const UL_COMPARE_AND_WAIT_SHARED: u32 = 3;
     const ULF_WAKE_ALL: u32 = 0x0000_0100;
     const ULF_NO_ERRNO: u32 = 0x0100_0000;
     const ETIMEDOUT: i32 = 60;
@@ -266,10 +268,14 @@ mod imp {
         fn __ulock_wake(operation: u32, address: *mut c_void, wake_value: u64) -> i32;
     }
 
-    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>) -> bool {
+    const fn compare_and_wait(pinfo: u128) -> u32 {
+        if pinfo == 0 { UL_COMPARE_AND_WAIT } else { UL_COMPARE_AND_WAIT_SHARED }
+    }
+
+    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>, pinfo: u128) -> bool {
         let result = unsafe {
             __ulock_wait2(
-                UL_COMPARE_AND_WAIT | ULF_NO_ERRNO,
+                compare_and_wait(pinfo) | ULF_NO_ERRNO,
                 atomic as *const AtomicU32 as *mut c_void,
                 expected as u64,
                 timeout_ns.unwrap_or(0),
@@ -279,8 +285,8 @@ mod imp {
         result != -ETIMEDOUT
     }
 
-    pub(super) fn wake(atomic: &AtomicU32, all: bool) -> Option<u32> {
-        let operation = UL_COMPARE_AND_WAIT | ULF_NO_ERRNO | if all { ULF_WAKE_ALL } else { 0 };
+    pub(super) fn wake(atomic: &AtomicU32, all: bool, pinfo: u128) -> Option<u32> {
+        let operation = compare_and_wait(pinfo) | ULF_NO_ERRNO | if all { ULF_WAKE_ALL } else { 0 };
         unsafe {
             let _ = __ulock_wake(operation, atomic as *const AtomicU32 as *mut c_void, 0);
         }
@@ -305,6 +311,8 @@ mod imp {
         tv_nsec: CLong,
     }
 
+    const UMTX_OP_WAKE: i32 = 3;
+    const UMTX_OP_WAIT_UINT: i32 = 11;
     const UMTX_OP_WAIT_UINT_PRIVATE: i32 = 15;
     const UMTX_OP_WAKE_PRIVATE: i32 = 16;
     const ETIMEDOUT: i32 = 60;
@@ -328,7 +336,7 @@ mod imp {
         }
     }
 
-    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>) -> bool {
+    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>, pinfo: u128) -> bool {
         let timeout = timeout_ns.map(relative_timespec);
         let (size, timeout_ptr) =
             timeout
@@ -342,7 +350,7 @@ mod imp {
         let result = unsafe {
             _umtx_op(
                 atomic as *const AtomicU32 as *mut c_void,
-                UMTX_OP_WAIT_UINT_PRIVATE,
+                if pinfo == 0 { UMTX_OP_WAIT_UINT_PRIVATE } else { UMTX_OP_WAIT_UINT },
                 expected as usize,
                 size,
                 timeout_ptr,
@@ -351,12 +359,12 @@ mod imp {
         result >= 0 || unsafe { *__error() } != ETIMEDOUT
     }
 
-    pub(super) fn wake(atomic: &AtomicU32, all: bool) -> Option<u32> {
+    pub(super) fn wake(atomic: &AtomicU32, all: bool, pinfo: u128) -> Option<u32> {
         let count = if all { i32::MAX as usize } else { 1 };
         unsafe {
             let _ = _umtx_op(
                 atomic as *const AtomicU32 as *mut c_void,
-                UMTX_OP_WAKE_PRIVATE,
+                if pinfo == 0 { UMTX_OP_WAKE_PRIVATE } else { UMTX_OP_WAKE },
                 count,
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -375,7 +383,7 @@ mod imp {
     #[cfg(target_arch = "wasm64")]
     use core::arch::wasm64 as wasm;
 
-    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>) -> bool {
+    pub(super) fn wait(atomic: &AtomicU32, expected: u32, timeout_ns: Option<u64>, _pinfo: u128) -> bool {
         let timeout = timeout_ns
             .and_then(|ns| i64::try_from(ns).ok())
             .unwrap_or(-1);
@@ -388,7 +396,7 @@ mod imp {
         }
     }
 
-    pub(super) fn wake(atomic: &AtomicU32, all: bool) -> Option<u32> {
+    pub(super) fn wake(atomic: &AtomicU32, all: bool, _pinfo: u128) -> Option<u32> {
         let count = if all { u32::MAX } else { 1 };
         Some(unsafe { wasm::memory_atomic_notify(atomic as *const AtomicU32 as *mut i32, count) })
     }
@@ -415,18 +423,23 @@ mod tests {
     #[test]
     fn mismatched_wait_returns_immediately() {
         let atomic = AtomicU32::new(7);
-        wait(&atomic, 6);
-        assert!(wait_timeout(&atomic, 6, 1));
+        wait(&atomic, 6, 0);
+        assert!(wait_timeout(&atomic, 6, 1, 0));
     }
 
     #[test]
     fn zero_timeout_does_not_block() {
         let atomic = AtomicU32::new(7);
-        assert!(!wait_timeout(&atomic, 7, 0));
+        assert!(!wait_timeout(&atomic, 7, 0, 0));
     }
 
     #[test]
-    fn wake_releases_or_races_with_waiter() {
+    fn nonzero_timeout_elapses() {
+        let atomic = AtomicU32::new(7);
+        assert!((0..5).any(|_| !wait_timeout(&atomic, 7, 1_000_000, 0)));
+    }
+
+    fn wake_releases_or_races_with_waiter(pinfo: u128, wake: fn(&AtomicU32) -> Option<u32>) {
         let atomic = Arc::new(AtomicU32::new(0));
         let ready = Arc::new(AtomicU32::new(0));
         let worker_atomic = Arc::clone(&atomic);
@@ -434,7 +447,7 @@ mod tests {
 
         let worker = thread::spawn(move || {
             worker_ready.store(1, Ordering::Release);
-            wait(&worker_atomic, 0);
+            wait(&worker_atomic, 0, pinfo);
             assert_eq!(worker_atomic.load(Ordering::Acquire), 1);
         });
 
@@ -442,7 +455,34 @@ mod tests {
             core::hint::spin_loop();
         }
         atomic.store(1, Ordering::Release);
-        let _ = wake_one(&atomic);
+        let _ = wake(&atomic);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn wake_one_releases_or_races_with_waiter() {
+        wake_releases_or_races_with_waiter(0, wake_one);
+    }
+
+    #[test]
+    fn wake_all_releases_or_races_with_waiter() {
+        wake_releases_or_races_with_waiter(0, |atomic| wake_all(atomic, 0));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn shared_wake_all_releases_or_races_with_shared_waiter() {
+        wake_releases_or_races_with_waiter(1, |atomic| wake_all(atomic, 1));
+        wake_releases_or_races_with_waiter(u128::MAX, |atomic| wake_all(atomic, u128::MAX));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn shared_waits_time_out_and_skip_on_mismatch() {
+        let atomic = AtomicU32::new(7);
+        wait(&atomic, 6, 1);
+        assert!(wait_timeout(&atomic, 6, 1, 1));
+        assert!(!wait_timeout(&atomic, 7, 0, 1));
+        assert!((0..5).any(|_| !wait_timeout(&atomic, 7, 1_000_000, 1)));
     }
 }

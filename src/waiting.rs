@@ -284,7 +284,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             Ok(number_id) => {
                 let f = get_futex(self.track(), number_id.id);
                 f.fetch_add(1, Ordering::Release);
-                let _ = futex::wake_all(f);
+                let _ = futex::wake_all(f, 0);
                 Ok(number_id)
             },
             Err(e) => Err(e),
@@ -400,7 +400,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
         }
-        futex::wait(get_futex(self.track(), id), expected);
+        futex::wait(get_futex(self.track(), id), expected, 0);
         Ok(())
     }
 
@@ -409,7 +409,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
         }
-        Ok(futex::wait_timeout(get_futex(self.track(), id), expected, timeout_ns))
+        Ok(futex::wait_timeout(get_futex(self.track(), id), expected, timeout_ns, 0))
     }
 
     fn __wait_for_enter_timeout(&self, id: NumericType, timeout_ns: Option<(u64, Instant)>) -> Result<NumberId, WaitError> {
@@ -451,10 +451,10 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
                             if freeze >= *timeout_ns {
                                 return Err(WaitError::NotFound);
                             }
-                            let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze);
+                            let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze, 0);
                         },
                         _ => {
-                            let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after);
+                            let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after, 0);
                         },
                     }
                     continue;
@@ -559,10 +559,10 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
                                 }
                                 return Err(WaitError::NotFound);
                             }
-                            let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze);
+                            let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze, 0);
                         },
                         _ => {
-                            let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after);
+                            let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after, 0);
                         },
                     }
                     continue;
@@ -590,7 +590,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         let result = self.track().leave(number);
         let f = get_futex(self.track(), number.id);
         f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f);
+        let _ = futex::wake_all(f, 0);
         result
     }
 
@@ -598,7 +598,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         let result = self.track().leave_concurrent(number);
         let f = get_futex(self.track(), number.id);
         f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f);
+        let _ = futex::wake_all(f, 0);
         result
     }
 }
@@ -623,7 +623,7 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
     pub fn signal_change(&self) {
         let f = get_futex(self.atomic_track_waiting.track(), self.inner.id);
         f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f);
+        let _ = futex::wake_all(f, 0);
     }
 
     pub fn wait_gte(&self, at_least: NumericType) -> Result<NumericType, WaitError> {
@@ -654,12 +654,12 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
 
     /// See [`AtomicTrackWaiting::wait_spurious`].
     pub fn wait_spurious(&self, expected: u32) {
-        futex::wait(get_futex(self.atomic_track_waiting.track(), self.inner.id), expected);
+        futex::wait(get_futex(self.atomic_track_waiting.track(), self.inner.id), expected, 0);
     }
 
     /// See [`AtomicTrackWaiting::wait_spurious_timeout`].
     pub fn wait_spurious_timeout(&self, expected: u32, timeout_ns: u64) -> bool {
-        futex::wait_timeout(get_futex(self.atomic_track_waiting.track(), self.inner.id), expected, timeout_ns)
+        futex::wait_timeout(get_futex(self.atomic_track_waiting.track(), self.inner.id), expected, timeout_ns, 0)
     }
 
     fn __wait_gte_timeout(&self, at_least: NumericType, expected_user_bits: Option<NumericType>, timeout_ns: Option<(u64, Instant)>) -> Result<(WaitGteStatus, NumericType), WaitError> {
@@ -726,10 +726,10 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
                             if freeze >= *timeout_ns {
                                 return Ok((WaitGteStatus::TimedOut, without_suspended_bit(value)));
                             }
-                            let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze);
+                            let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze, 0);
                         },
                         _ => {
-                            let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after);
+                            let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after, 0);
                         },
                     }
                     continue;
@@ -788,7 +788,7 @@ mod tests {
                 let started = Instant::now();
                 while !stop.load(Ordering::Relaxed) && started.elapsed() < WATCHDOG {
                     futex.fetch_add(1, Ordering::Release);
-                    let _ = futex::wake_all(futex);
+                    let _ = futex::wake_all(futex, 0);
                 }
             }));
         }
