@@ -29,13 +29,26 @@ const _: () = {
     assert!(DEFAULT_NUM_FUTEXES.is_power_of_two(), "FUTEX pool size must be power of two!");
 };
 
-#[repr(transparent)]
+pub const WAITING_POOL_JOIN_NONE: u64 = 0;
+
 struct ListofAtomicsWrapper {
     s: &'static [AtomicU32],
+    waiting_pool_join: u64,
+}
+
+impl ListofAtomicsWrapper {
+    #[inline]
+    fn pinfo(&self) -> u128 {
+        if self.waiting_pool_join == WAITING_POOL_JOIN_NONE {
+            0
+        } else {
+            ((self.waiting_pool_join as u128) << 64) | self.s.as_ptr().addr() as u128
+        }
+    }
 }
 
 static FUTEXES: AtomicPtr<ListofAtomicsWrapper> = AtomicPtr::new(
-    &ListofAtomicsWrapper { s: &[] } as *const _ as *mut _
+    &ListofAtomicsWrapper { s: &[], waiting_pool_join: WAITING_POOL_JOIN_NONE } as *const _ as *mut _
 );
 
 static FUTEX_POOL_FREE_INIT: AtomicU32 = AtomicU32::new(1);
@@ -49,6 +62,10 @@ fn prev_power_of_two(n: usize) -> usize {
 }
 
 /// Sets the waiting pool (a simple array of atomic u32s).
+///
+/// Having `waiting_pool_join` be a non-zero value causes futex operations to assume cross-process. `WAITING_POOL_JOIN_NONE`
+/// gives you process-private futexes as usual. Note that it is your responsibility to make sure that `ptr` is in a shared memory
+/// location if you specify `waiting_pool_join`. Within each process, they *can* be mapped at different base addresses.
 ///
 /// Returns 0 for success, 1 for when the pool was set by someone else instead (you can retry), -1 for invalid arguments.
 ///
@@ -64,7 +81,7 @@ fn prev_power_of_two(n: usize) -> usize {
 #[allow(non_snake_case)]
 #[cfg(feature = "std")]
 #[cfg_attr(feature = "capi", unsafe(no_mangle))]
-pub unsafe extern "C" fn A_T_set_waiting_pool(ptr: *const AtomicU32, mut len: usize) -> i32 {
+pub unsafe extern "C" fn A_T_set_waiting_pool(ptr: *const AtomicU32, mut len: usize, waiting_pool_join: u64) -> i32 {
     len = prev_power_of_two(len);
     if len == 0 {
         return -1;
@@ -76,7 +93,7 @@ pub unsafe extern "C" fn A_T_set_waiting_pool(ptr: *const AtomicU32, mut len: us
         return -1;
     }
     let slice: &'static [AtomicU32] = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let wrapper = Box::new(ListofAtomicsWrapper { s: slice });
+    let wrapper = Box::new(ListofAtomicsWrapper { s: slice, waiting_pool_join });
     let base = FUTEX_POOL_FREE_INIT.load(Ordering::Acquire);
     if base % 2 == 1 {
         // settled state, can change.
@@ -92,9 +109,9 @@ pub unsafe extern "C" fn A_T_set_waiting_pool(ptr: *const AtomicU32, mut len: us
 }
 
 #[inline]
-fn futexes() -> &'static [AtomicU32] {
-    let futexes = unsafe { (*FUTEXES.load(Ordering::Acquire)).s };
-    if !futexes.is_empty() {
+fn futexes() -> &'static ListofAtomicsWrapper {
+    let futexes = unsafe { &*FUTEXES.load(Ordering::Acquire) };
+    if !futexes.s.is_empty() {
         return futexes;
     }
     futexes_slow()
@@ -102,16 +119,16 @@ fn futexes() -> &'static [AtomicU32] {
 
 #[cold]
 #[inline(never)]
-fn futexes_slow() -> &'static [AtomicU32] {
+fn futexes_slow() -> &'static ListofAtomicsWrapper {
     let s = unsafe {
         Box::<[AtomicU32]>::new_zeroed_slice(DEFAULT_NUM_FUTEXES).assume_init()
     };
     let mut wrapper = Box::new(
-        ListofAtomicsWrapper { s: &[] },
+        ListofAtomicsWrapper { s: &[], waiting_pool_join: WAITING_POOL_JOIN_NONE },
     );
     let mut base = FUTEX_POOL_FREE_INIT.load(Ordering::Acquire);
-    let mut futexes = unsafe { (*FUTEXES.load(Ordering::Acquire)).s };
-    'outer: while futexes.is_empty() {
+    let mut futexes = unsafe { &*FUTEXES.load(Ordering::Acquire) };
+    'outer: while futexes.s.is_empty() {
         if base % 2 == 0 {
             while FUTEX_POOL_FREE_INIT.load(Ordering::Acquire) % 2 == 0 {
                 yield_now();
@@ -123,23 +140,23 @@ fn futexes_slow() -> &'static [AtomicU32] {
                     wrapper.s = Box::leak(s);
                     FUTEXES.store(Box::leak(wrapper), Ordering::Release);
                     FUTEX_POOL_FREE_INIT.store(base.wrapping_add(2), Ordering::Release);
-                    futexes = unsafe { (*FUTEXES.load(Ordering::Acquire)).s };
+                    futexes = unsafe { &*FUTEXES.load(Ordering::Acquire) };
                     break 'outer;
                 }
             }
         }
         base = FUTEX_POOL_FREE_INIT.load(Ordering::Acquire);
-        futexes = unsafe { (*FUTEXES.load(Ordering::Acquire)).s };
+        futexes = unsafe { &*FUTEXES.load(Ordering::Acquire) };
     }
     futexes
 }
 
-fn futex(i: usize) -> &'static AtomicU32 {
+fn futex(i: usize) -> (&'static AtomicU32, u128) {
     let futexes = futexes();
-    &futexes[i & (futexes.len() - 1)]
+    (&futexes.s[i & (futexes.s.len() - 1)], futexes.pinfo())
 }
 
-fn get_futex<T: ?Sized>(a: &T, b: NumericType) -> &'static AtomicU32 {
+fn get_futex<T: ?Sized>(a: &T, b: NumericType) -> (&'static AtomicU32, u128) {
     let mut hasher = hasher::RhmHasher::default();
     (a as *const T).addr().hash(&mut hasher);
     b.hash(&mut hasher);
@@ -282,9 +299,9 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
     pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
         match self.track().enter_from(id, at_least) {
             Ok(number_id) => {
-                let f = get_futex(self.track(), number_id.id);
+                let (f, pinfo) = get_futex(self.track(), number_id.id);
                 f.fetch_add(1, Ordering::Release);
-                let _ = futex::wake_all(f, 0);
+                let _ = futex::wake_all(f, pinfo);
                 Ok(number_id)
             },
             Err(e) => Err(e),
@@ -392,7 +409,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
         }
-        Ok(get_futex(self.track(), id).load(Ordering::Acquire))
+        Ok(get_futex(self.track(), id).0.load(Ordering::Acquire))
     }
 
     /// Sleeps while the futex word for `id` still equals `expected`. Can return spuriously, especially since the number of futexes is fixed and futexes are shared with other ids.
@@ -400,7 +417,8 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
         }
-        futex::wait(get_futex(self.track(), id), expected, 0);
+        let (f, pinfo) = get_futex(self.track(), id);
+        futex::wait(f, expected, pinfo);
         Ok(())
     }
 
@@ -409,7 +427,8 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
         }
-        Ok(futex::wait_timeout(get_futex(self.track(), id), expected, timeout_ns, 0))
+        let (f, pinfo) = get_futex(self.track(), id);
+        Ok(futex::wait_timeout(f, expected, timeout_ns, pinfo))
     }
 
     fn __wait_for_enter_timeout(&self, id: NumericType, timeout_ns: Option<(u64, Instant)>) -> Result<NumberId, WaitError> {
@@ -422,7 +441,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         let futex_getter = || get_futex(self.track(), id);
         loop {
             if i >= MAX_LOOPS_BEFORE_SLEEP {
-                futex_value_before = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
+                futex_value_before = f.get_or_insert_with(&futex_getter).0.load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
             //NOTE: `recover` returns None and stops probing if it finds a slot with the right key but that is still locked, but this is fine because if it's locked it should soon be unlocked, at which point the thread that finished adding in the id to the slot will wake this thread up again, and it will recheck, and recover will then find it this time, so given the contract of finding whatever was the first to be found in the ring with the provided id, this is good.
@@ -439,7 +458,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
                 yield_now();
             } else {
                 // Load the futex value again.
-                let futex_value_after = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire);
+                let futex_value_after = f.get_or_insert_with(&futex_getter).0.load(Ordering::Acquire);
                 if futex_value_before != futex_value_after {
                     // The futex value has changed, so the number has also possibly changed. We need to recheck.
                     core::hint::spin_loop();
@@ -451,10 +470,12 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
                             if freeze >= *timeout_ns {
                                 return Err(WaitError::NotFound);
                             }
-                            let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze, 0);
+                            let (word, pinfo) = *f.get_or_insert_with(&futex_getter);
+                            let _ = futex::wait_timeout(word, futex_value_after, timeout_ns - freeze, pinfo);
                         },
                         _ => {
-                            let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after, 0);
+                            let (word, pinfo) = *f.get_or_insert_with(&futex_getter);
+                            let _ = futex::wait(word, futex_value_after, pinfo);
                         },
                     }
                     continue;
@@ -485,7 +506,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             let mut value = None;
 
             if i >= MAX_LOOPS_BEFORE_SLEEP {
-                futex_value_before = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
+                futex_value_before = f.get_or_insert_with(&futex_getter).0.load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
             if number.is_none() {
@@ -541,7 +562,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
                 yield_now();
             } else {
                 // Load the futex value again.
-                let futex_value_after = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire);
+                let futex_value_after = f.get_or_insert_with(&futex_getter).0.load(Ordering::Acquire);
                 if futex_value_before != futex_value_after {
                     // The futex value has changed, so the number has also possibly changed. We need to recheck.
                     core::hint::spin_loop();
@@ -559,10 +580,12 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
                                 }
                                 return Err(WaitError::NotFound);
                             }
-                            let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze, 0);
+                            let (word, pinfo) = *f.get_or_insert_with(&futex_getter);
+                            let _ = futex::wait_timeout(word, futex_value_after, timeout_ns - freeze, pinfo);
                         },
                         _ => {
-                            let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after, 0);
+                            let (word, pinfo) = *f.get_or_insert_with(&futex_getter);
+                            let _ = futex::wait(word, futex_value_after, pinfo);
                         },
                     }
                     continue;
@@ -588,17 +611,17 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
 
     pub fn leave(&self, number: NumberId) -> Result<(), LeaveError> {
         let result = self.track().leave(number);
-        let f = get_futex(self.track(), number.id);
+        let (f, pinfo) = get_futex(self.track(), number.id);
         f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f, 0);
+        let _ = futex::wake_all(f, pinfo);
         result
     }
 
     pub fn leave_concurrent(&self, number: NumberId) -> Result<(), LeaveError> {
         let result = self.track().leave_concurrent(number);
-        let f = get_futex(self.track(), number.id);
+        let (f, pinfo) = get_futex(self.track(), number.id);
         f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f, 0);
+        let _ = futex::wake_all(f, pinfo);
         result
     }
 }
@@ -621,9 +644,9 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
     }
 
     pub fn signal_change(&self) {
-        let f = get_futex(self.atomic_track_waiting.track(), self.inner.id);
+        let (f, pinfo) = get_futex(self.atomic_track_waiting.track(), self.inner.id);
         f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f, 0);
+        let _ = futex::wake_all(f, pinfo);
     }
 
     pub fn wait_gte(&self, at_least: NumericType) -> Result<NumericType, WaitError> {
@@ -649,17 +672,19 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
 
     /// See [`AtomicTrackWaiting::futex_word_value`].
     pub fn futex_word_value(&self) -> u32 {
-        get_futex(self.atomic_track_waiting.track(), self.inner.id).load(Ordering::Acquire)
+        get_futex(self.atomic_track_waiting.track(), self.inner.id).0.load(Ordering::Acquire)
     }
 
     /// See [`AtomicTrackWaiting::wait_spurious`].
     pub fn wait_spurious(&self, expected: u32) {
-        futex::wait(get_futex(self.atomic_track_waiting.track(), self.inner.id), expected, 0);
+        let (f, pinfo) = get_futex(self.atomic_track_waiting.track(), self.inner.id);
+        futex::wait(f, expected, pinfo);
     }
 
     /// See [`AtomicTrackWaiting::wait_spurious_timeout`].
     pub fn wait_spurious_timeout(&self, expected: u32, timeout_ns: u64) -> bool {
-        futex::wait_timeout(get_futex(self.atomic_track_waiting.track(), self.inner.id), expected, timeout_ns, 0)
+        let (f, pinfo) = get_futex(self.atomic_track_waiting.track(), self.inner.id);
+        futex::wait_timeout(f, expected, timeout_ns, pinfo)
     }
 
     fn __wait_gte_timeout(&self, at_least: NumericType, expected_user_bits: Option<NumericType>, timeout_ns: Option<(u64, Instant)>) -> Result<(WaitGteStatus, NumericType), WaitError> {
@@ -671,7 +696,7 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
             let mut value;
 
             if i >= MAX_LOOPS_BEFORE_SLEEP {
-                futex_value_before = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
+                futex_value_before = f.get_or_insert_with(&futex_getter).0.load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
             loop {
@@ -714,7 +739,7 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
                 yield_now();
             } else {
                 // Load the futex value again.
-                let futex_value_after = f.get_or_insert_with(&futex_getter).load(Ordering::Acquire);
+                let futex_value_after = f.get_or_insert_with(&futex_getter).0.load(Ordering::Acquire);
                 if futex_value_before != futex_value_after {
                     // The futex value has changed, so the number has also possibly changed. We need to recheck.
                     core::hint::spin_loop();
@@ -726,10 +751,12 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
                             if freeze >= *timeout_ns {
                                 return Ok((WaitGteStatus::TimedOut, without_suspended_bit(value)));
                             }
-                            let _ = futex::wait_timeout(f.get_or_insert_with(&futex_getter), futex_value_after, timeout_ns - freeze, 0);
+                            let (word, pinfo) = *f.get_or_insert_with(&futex_getter);
+                            let _ = futex::wait_timeout(word, futex_value_after, timeout_ns - freeze, pinfo);
                         },
                         _ => {
-                            let _ = futex::wait(f.get_or_insert_with(&futex_getter), futex_value_after, 0);
+                            let (word, pinfo) = *f.get_or_insert_with(&futex_getter);
+                            let _ = futex::wait(word, futex_value_after, pinfo);
                         },
                     }
                     continue;
@@ -770,7 +797,7 @@ mod tests {
     const TEST_WATCHDOG: Duration = Duration::from_secs(2);
 
     fn run_while_futex_is_hot<R>(
-        futex: &'static AtomicU32,
+        (futex, pinfo): (&'static AtomicU32, u128),
         operation: impl FnOnce() -> R,
     ) -> (R, Duration) {
         const HOT_THREADS: usize = 4;
@@ -788,7 +815,7 @@ mod tests {
                 let started = Instant::now();
                 while !stop.load(Ordering::Relaxed) && started.elapsed() < WATCHDOG {
                     futex.fetch_add(1, Ordering::Release);
-                    let _ = futex::wake_all(futex, 0);
+                    let _ = futex::wake_all(futex, pinfo);
                 }
             }));
         }
@@ -939,6 +966,22 @@ mod tests {
 
         assert_eq!(receiver.recv_timeout(TEST_WATCHDOG).expect("hand-rolled wait did not wake"), 5);
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn pinfo_is_zero_without_a_join_and_packs_join_and_base_otherwise() {
+        static POOL: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+        let private = ListofAtomicsWrapper { s: &POOL, waiting_pool_join: WAITING_POOL_JOIN_NONE };
+        assert_eq!(private.pinfo(), 0);
+
+        let shared = ListofAtomicsWrapper { s: &POOL, waiting_pool_join: 0xABCD };
+        assert_eq!(shared.pinfo() >> 64, 0xABCD);
+        assert_eq!(shared.pinfo() as u64 as usize, POOL.as_ptr().addr());
+
+        let track = AtomicTrackWaiting::new_default(1);
+        let (word, pinfo) = get_futex(track.track(), 5);
+        assert_eq!(pinfo, futexes().pinfo());
+        assert!(futexes().s.as_ptr_range().contains(&ptr::from_ref(word)));
     }
 
     #[test]
