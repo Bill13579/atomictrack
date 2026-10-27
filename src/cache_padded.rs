@@ -89,6 +89,7 @@ unsafe impl<T: Sync> Sync for CachePadded<T> {}
 /// s does not have any factors of 2 by construction, so 2^k is unable to divide it, and while |i-j| is less than 2^k (0 < |i-j| < 2^k), 2^k can never divide |i-j| either.
 ///
 /// There are no collisions until after consecutive 2^k range. □
+#[cfg_attr(not(feature = "waiting"), allow(dead_code))]
 pub(crate) const fn stride<T>() -> usize {
     align_of::<CachePadded<()>>().div_ceil(size_of::<T>()) | 1
 }
