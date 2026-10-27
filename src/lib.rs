@@ -298,11 +298,11 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
     /// Also note that if `USER_BIT_LOW` and `USER_BITS_DEFAULT` is different between when initialization happened and usage here, existing user bits might potentially become interpreted as the number part instead of the user bits part or vice versa.
     pub unsafe fn from_raw<'a>(ptr: NonNull<u8>, capacity: usize) -> &'a Self {
         let () = Self::VALID;
-        assert!(
+        debug_assert!(
             capacity.is_power_of_two(),
             "capacity must be a power of two"
         );
-        assert!(
+        debug_assert!(
             AtomicTrack::layout(capacity).is_some(),
             "capacity is too large"
         );
@@ -637,7 +637,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
 
     #[inline]
     fn index_for_offsetted(&self, id: NumericType, placement_offset: usize) -> usize {
-        (id as usize + placement_offset) & self.mask()
+        (id as usize).wrapping_add(placement_offset) & self.mask()
     }
 }
 
@@ -668,7 +668,7 @@ impl<'a, const L: u32> Number<'a, L> {
     }
 
     pub fn raise_to(&self, at_least: NumericType) -> Result<NumericType, NumberError> {
-        assert!(
+        debug_assert!(
             is_valid_public_value(at_least),
             "at_least must fit in the public number range"
         );

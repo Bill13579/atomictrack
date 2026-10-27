@@ -18,6 +18,11 @@ pub type AtomicType = AtomicU64;
 #[cfg(not(feature = "smaller-atomics"))]
 pub type NumericType = u64;
 
+#[cfg(all(not(feature = "smaller-atomics"), not(target_has_atomic = "64")))]
+compile_error!(
+    "target doesn't support 64-bit atomics, enable the `smaller-atomics` feature to use 32-bit atomics instead"
+);
+
 pub const MSB: NumericType = NumericType::MAX - (NumericType::MAX >> 1);
 
 /// bits `0..user_bit_low`:                  number
