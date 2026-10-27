@@ -29,6 +29,10 @@ const _: () = {
     assert!(DEFAULT_NUM_FUTEXES.is_power_of_two(), "FUTEX pool size must be power of two!");
 };
 
+/// N more bits ignored which also map to strided identity hash range
+const FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT: u32 = env_or_default!("ATOMICTRACK_FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT", "2", u32);
+const _: () = assert!(FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT < usize::BITS, "ATOMICTRACK_FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT must be less than the number of bits in usize");
+
 pub const WAITING_POOL_JOIN_NONE: u64 = 0;
 
 struct ListofAtomicsWrapper {
@@ -156,7 +160,14 @@ fn futex(i: usize) -> (&'static AtomicU32, u128) {
     (&futexes.s[i & (futexes.s.len() - 1)], futexes.pinfo())
 }
 
+const FUTEX_STRIDE: usize = crate::cache_padded::stride::<AtomicU32>();
+
 fn get_futex<const L: u32, const I: NumericType>(track: &AtomicTrack<[CachePadded<Slot>], L, I>, id: NumericType) -> (&'static AtomicU32, u128) {
+    if let Ok(id) = usize::try_from(id) && id >> FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT < futexes().s.len() {
+        let x = track.seed().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let base = ((x ^ (x >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize;
+        return futex(base.wrapping_add(id.wrapping_mul(FUTEX_STRIDE)));
+    }
     let mut hasher = hasher::RhmHasher::default();
     hasher.write(&track.seed().to_le_bytes());
     #[allow(clippy::unnecessary_cast)]
@@ -1024,12 +1035,49 @@ mod tests {
 
             let mut hasher = hasher::RhmHasher::default();
             hasher.write(&(first.as_ptr().addr() as u64).to_le_bytes());
-            hasher.write(&77u64.to_le_bytes());
-            assert!(ptr::eq(get_futex(elsewhere, 77).0, futex(hasher.finish() as usize).0));
+            hasher.write(&(id_of("renderer") as u64).to_le_bytes());
+            assert!(ptr::eq(get_futex(elsewhere, id_of("renderer")).0, futex(hasher.finish() as usize).0));
 
             std::alloc::dealloc(first.as_ptr(), layout);
             std::alloc::dealloc(second.as_ptr(), layout);
         }
+    }
+
+    #[test]
+    fn ids_below_the_pool_length_get_distinct_futex_words_a_cache_line_apart() {
+        let track = AtomicTrackWaiting::new_default(4);
+        let pool = futexes().s;
+        let index_of = |id| (ptr::from_ref(get_futex(track.track(), id).0).addr() - pool.as_ptr().addr()) / size_of::<AtomicU32>();
+
+        let mut seen = std::vec![false; pool.len()];
+        for id in 0..pool.len() as NumericType {
+            let index = index_of(id);
+            assert!(!seen[index], "id {id} shares futex word {index}");
+            seen[index] = true;
+        }
+
+        let line = align_of::<CachePadded<()>>();
+        for id in 1..64.min(pool.len() as NumericType) {
+            let distance = index_of(id).wrapping_sub(index_of(id - 1)) & (pool.len() - 1);
+            assert!(distance * size_of::<AtomicU32>() >= line || size_of_val(pool) <= line, "ids {} and {id} are {distance} words apart", id - 1);
+        }
+    }
+
+    #[test]
+    fn ids_mirror_onto_the_same_futex_words_until_the_ignored_bits_run_out() {
+        let track = AtomicTrackWaiting::new_default(4);
+        let pool = futexes().s;
+        let end = pool.len() << FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT;
+
+        for id in pool.len()..end {
+            let mirror = id % pool.len();
+            assert!(ptr::eq(get_futex(track.track(), id as NumericType).0, get_futex(track.track(), mirror as NumericType).0), "id {id} and its mirror {mirror}");
+        }
+
+        let mut hasher = hasher::RhmHasher::default();
+        hasher.write(&track.track().seed().to_le_bytes());
+        hasher.write(&(end as u64).to_le_bytes());
+        assert!(ptr::eq(get_futex(track.track(), end as NumericType).0, futex(hasher.finish() as usize).0));
     }
 
     static STATIC_TRACK: crate::ArrayAtomicTrack<4> = crate::ArrayAtomicTrack::new();
