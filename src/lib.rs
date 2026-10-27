@@ -87,6 +87,22 @@ const fn key_bits(key: NumericType) -> NumericType {
     key & !KEY_LOCK_BIT
 }
 
+#[doc(hidden)]
+#[inline]
+pub const fn __key_bits(key: NumericType) -> NumericType {
+    key_bits(key)
+}
+
+#[macro_export]
+macro_rules! pair {
+    ($static:expr, $runtime:expr $(,)?) => {
+        $crate::__key_bits($crate::math::NumericType::wrapping_add(
+            const { let id: $crate::math::NumericType = $static; id },
+            ($runtime) as $crate::math::NumericType,
+        ))
+    };
+}
+
 /// Is the key's lock bit (which is the MSB) set? If it's set (and it's not empty, since if it's empty then it can't logically be locked, though that's obvious but the compiler will strip this out) then it's locked.
 #[inline]
 const fn is_key_locked(key: NumericType) -> bool {
