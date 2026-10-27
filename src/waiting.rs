@@ -163,9 +163,12 @@ fn futex(i: usize) -> (&'static AtomicU32, u128) {
 const FUTEX_STRIDE: usize = crate::cache_padded::stride::<AtomicU32>();
 
 fn get_futex<const L: u32, const I: NumericType>(track: &AtomicTrack<[CachePadded<Slot>], L, I>, id: NumericType) -> (&'static AtomicU32, u128) {
-    if let Ok(id) = usize::try_from(id) && id >> FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT < futexes().s.len() {
+    let len = futexes().s.len();
+    if let Ok(id) = usize::try_from(id) && id >> FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT < len {
         let x = track.seed().wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let base = ((x ^ (x >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize;
+        // Mirror m placed at m · len/2^N relative to mirror 0 at 0 (where N = FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT)
+        let id = (id & (len - 1)) + (id >> len.trailing_zeros()) * (len >> FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT);
         return futex(base.wrapping_add(id.wrapping_mul(FUTEX_STRIDE)));
     }
     let mut hasher = hasher::RhmHasher::default();
@@ -1064,14 +1067,25 @@ mod tests {
     }
 
     #[test]
-    fn ids_mirror_onto_the_same_futex_words_until_the_ignored_bits_run_out() {
+    fn mirrors_are_offset_so_sparse_blocks_do_not_alias_until_the_ignored_bits_run_out() {
         let track = AtomicTrackWaiting::new_default(4);
         let pool = futexes().s;
         let end = pool.len() << FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT;
+        let offset = pool.len() >> FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT;
+        let index_of = |id: usize| (ptr::from_ref(get_futex(track.track(), id as NumericType).0).addr() - pool.as_ptr().addr()) / size_of::<AtomicU32>();
 
         for id in pool.len()..end {
-            let mirror = id % pool.len();
-            assert!(ptr::eq(get_futex(track.track(), id as NumericType).0, get_futex(track.track(), mirror as NumericType).0), "id {id} and its mirror {mirror}");
+            let partner = (id % pool.len() + id / pool.len() * offset) % pool.len();
+            assert_eq!(index_of(id), index_of(partner), "id {id} and mirror 0 id {partner}");
+        }
+
+        let mut seen = std::vec![false; pool.len()];
+        for mirror in 0..1 << FUTEX_POOL_IDENTITY_MIRROR_IGNORE_SHIFT {
+            for id in mirror * pool.len()..mirror * pool.len() + offset {
+                let index = index_of(id);
+                assert!(!seen[index], "id {id} shares futex word {index} with another mirror's block");
+                seen[index] = true;
+            }
         }
 
         let mut hasher = hasher::RhmHasher::default();
