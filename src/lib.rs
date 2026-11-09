@@ -204,6 +204,8 @@ pub enum NumberError {
     NotFound,
     /// Number already past the target ([`set_to`](`Number::set_to`)).
     PassedTarget(NumericType),
+    /// [`add_within`](`Number::add_within`) did not add since the result would exceed the limit.
+    Exceeded(NumericType),
     /// A `try_*` lost on the compare-exchange to a concurrent change.
     CasFailed,
 }
@@ -395,7 +397,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
             Err(NumberError::InvalidOffset) => return Err(LeaveError::InvalidOffset),
             Err(NumberError::InvalidId) | Err(NumberError::NotFound) => return Err(LeaveError::NotFound),
             // Only value updates return these.
-            Err(NumberError::PassedTarget(_)) | Err(NumberError::CasFailed) => unreachable!(),
+            Err(NumberError::PassedTarget(_)) | Err(NumberError::Exceeded(_)) | Err(NumberError::CasFailed) => unreachable!(),
         };
 
         loop {
@@ -753,6 +755,17 @@ impl<'a, const L: u32> Number<'a, L> {
     }
 
     pub fn add(&self, delta: NumericType) -> Result<NumericType, NumberError> {
+        self.__add(delta, None)
+    }
+
+    /// Adds `delta` if the number would be equal to or less than the `limit` after the addition, failing with
+    /// [`NumberError::Exceeded(current)`](`NumberError::Exceeded`) otherwise.
+    pub fn add_within(&self, delta: NumericType, limit: NumericType) -> Result<NumericType, NumberError> {
+        self.__add(delta, Some(limit))
+    }
+
+    #[inline(always)]
+    fn __add(&self, delta: NumericType, limit: Option<NumericType>) -> Result<NumericType, NumberError> {
         loop {
             let key_before = self.slot.id.load(Ordering::Acquire);
             if key_before != self.id {
@@ -764,14 +777,21 @@ impl<'a, const L: u32> Number<'a, L> {
                 return Err(NumberError::NotFound);
             }
 
-            let next = (current.wrapping_add(delta) & Self::NUMBER_MASK)
-                | (delta & Self::USER_MASK);
-
             let key_after = self.slot.id.load(Ordering::Acquire);
             if key_before != key_after {
                 core::hint::spin_loop();
                 continue;
             }
+
+            if let Some(limit) = limit {
+                let room = limit.wrapping_sub(current) & Self::NUMBER_MASK;
+                if lt_masked(limit, current, Self::NUMBER_MASK) || delta & Self::NUMBER_MASK > room {
+                    return Err(NumberError::Exceeded(current));
+                }
+            }
+
+            let next = (current.wrapping_add(delta) & Self::NUMBER_MASK)
+                | (delta & Self::USER_MASK);
 
             match self.slot.value.compare_exchange(
                 current,
@@ -1384,5 +1404,76 @@ mod tests {
 
         assert_eq!(track.number(a).unwrap().get(), Ok(ROUNDS));
         assert_eq!(track.number(b).unwrap().get(), Ok(ROUNDS - 1));
+    }
+
+    #[test]
+    fn add_within_stops_at_the_limit() {
+        let track = ArrayAtomicTrack::<1>::new();
+        let number = track.number(track.enter(1).unwrap()).unwrap();
+
+        assert_eq!(number.add_within(3, 5), Ok(3));
+        assert_eq!(number.add_within(2, 5), Ok(5)); // exactly on the limit is fine
+        assert_eq!(number.add_within(1, 5), Err(NumberError::Exceeded(5)));
+        assert_eq!(number.add_within(0, 5), Ok(5));
+        assert_eq!(number.add_within(0, 4), Err(NumberError::Exceeded(5)));
+        assert_eq!(number.get(), Ok(5));
+    }
+
+    #[test]
+    fn add_within_takes_the_user_bits_from_delta() {
+        let track = ArrayAtomicTrack::<1, ONE_USER_BIT>::new();
+        let number = track.number(track.enter(1).unwrap()).unwrap();
+        assert_eq!(number.add_within(FLAG | 4, 10), Ok(FLAG | 4));
+        assert_eq!(number.add_within(1, 10), Ok(5));
+        assert_eq!(number.add_within(FLAG | 6, 10), Err(NumberError::Exceeded(5)));
+    }
+
+    #[test]
+    fn add_within_works_across_wrap() {
+        let track = ArrayAtomicTrack::<1>::new();
+        let number = track.number(track.enter(1).unwrap()).unwrap();
+        // Do it in two steps since MAX_PUBLIC - 1 is more than half the range away from 0 (it counts as behind).
+        let half = MAX_PUBLIC / 2;
+        number.add(half).unwrap();
+        assert_eq!(number.add(half), Ok(MAX_PUBLIC - 1));
+
+        // MAX_PUBLIC - 1 + 4 wraps to 2.
+        assert_eq!(number.add_within(5, 2), Err(NumberError::Exceeded(MAX_PUBLIC - 1)));
+        assert_eq!(number.add_within(4, 2), Ok(2));
+        assert_eq!(number.add_within(1, 2), Err(NumberError::Exceeded(2)));
+    }
+
+    #[test]
+    fn concurrent_add_within_hands_out_exactly_up_to_the_limit() {
+        const LIMIT: NumericType = if cfg!(miri) { 40 } else { 40_000 };
+        const THREADS: usize = 4;
+        let track = ArrayAtomicTrack::<1>::new();
+        let a = track.enter(1).unwrap();
+        let track = &track;
+
+        let claimed: NumericType = thread::scope(|s| {
+            let handles: std::vec::Vec<_> = (0..THREADS)
+                .map(|_| {
+                    s.spawn(move || {
+                        let number = track.number(a).unwrap();
+                        let mut claimed = 0;
+                        loop {
+                            match number.add_within(1, LIMIT) {
+                                Ok(_) => claimed += 1,
+                                Err(NumberError::Exceeded(found)) => {
+                                    assert_eq!(found, LIMIT);
+                                    return claimed;
+                                },
+                                other => panic!("unexpected {other:?}"),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+
+        assert_eq!(claimed, LIMIT);
+        assert_eq!(track.number(a).unwrap().get(), Ok(LIMIT));
     }
 }

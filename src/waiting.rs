@@ -450,7 +450,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             // get_slot_concurrent, and by extension `number` is just an indexing operation, they never return a NotFound error since NotFound checks additionally for whether the slot contains the actual id key.
             Err(NumberError::NotFound) => unreachable!(),
             // Only value updates return these.
-            Err(NumberError::PassedTarget(_)) | Err(NumberError::CasFailed) => unreachable!(),
+            Err(NumberError::PassedTarget(_)) | Err(NumberError::Exceeded(_)) | Err(NumberError::CasFailed) => unreachable!(),
         }
     }
 
@@ -466,7 +466,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             // get_slot_concurrent, and by extension `number` is just an indexing operation, they never return a NotFound error since NotFound checks additionally for whether the slot contains the actual id key.
             Err(NumberError::NotFound) => unreachable!(),
             // Only value updates return these.
-            Err(NumberError::PassedTarget(_)) | Err(NumberError::CasFailed) => unreachable!(),
+            Err(NumberError::PassedTarget(_)) | Err(NumberError::Exceeded(_)) | Err(NumberError::CasFailed) => unreachable!(),
         }
     }
 
@@ -737,6 +737,12 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
 
     pub fn add(&self, delta: NumericType) -> Result<NumericType, NumberError> {
         let result = self.inner.add(delta);
+        self.signal_change();
+        result
+    }
+
+    pub fn add_within(&self, delta: NumericType, limit: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.add_within(delta, limit);
         self.signal_change();
         result
     }
