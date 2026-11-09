@@ -38,6 +38,7 @@ mod windows {
 
     use atomictrack::{
         AtomicTrack,
+        math::NumericType,
         waiting::{A_T_set_waiting_pool, AtomicTrackWaiting, WAITING_POOL_JOIN_NONE},
     };
 
@@ -58,8 +59,8 @@ mod windows {
     const CAPACITY: usize = 16;
     const STAMP_OFFSET: usize = 16 * 1024;
 
-    const ID_A: u64 = 101;
-    const ID_B: u64 = 202;
+    const ID_A: NumericType = 101;
+    const ID_B: NumericType = 202;
     const DELAY: Duration = Duration::from_millis(300);
 
     fn wide(s: &str) -> Vec<u16> {

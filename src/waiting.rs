@@ -320,8 +320,14 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         self.track().min()
     }
 
-    pub fn find_min(&self) -> NumericType {
+    /// See [`AtomicTrack::find_min`]. Returns `(new_min, previous_min)`.
+    pub fn find_min(&self) -> (NumericType, NumericType) {
         self.track().find_min()
+    }
+
+    /// See [`AtomicTrack::find_min_bounded`]. Returns `(new_min, previous_min)`.
+    pub fn find_min_bounded(&self, bound: NumericType) -> (NumericType, NumericType) {
+        self.track().find_min_bounded(bound)
     }
 
     pub fn enter(&self, id: NumericType) -> Result<NumberId, EnterError> {
@@ -329,15 +335,27 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
     }
 
     pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
-        match self.track().enter_from(id, at_least) {
-            Ok(number_id) => {
-                let (f, pinfo) = get_futex(self.track(), number_id.id);
-                f.fetch_add(1, Ordering::Release);
-                let _ = futex::wake_all(f, pinfo);
-                Ok(number_id)
-            },
-            Err(e) => Err(e),
+        let result = self.track().enter_from(id, at_least);
+        if let Ok(number) = result {
+            self.signal(number);
         }
+        result
+    }
+
+    pub fn enter_at(&self, id: NumericType, at: NumericType) -> Result<NumberId, EnterError> {
+        let result = self.track().enter_at(id, at);
+        if let Ok(number) = result {
+            self.signal(number);
+        }
+        result
+    }
+
+    /// Wake everyone waiting on `number`'s futex.
+    #[inline]
+    fn signal(&self, number: NumberId) {
+        let (f, pinfo) = get_futex(self.track(), number.id);
+        f.fetch_add(1, Ordering::Release);
+        let _ = futex::wake_all(f, pinfo);
     }
 
     /// Recover a [`NumberId`] from a key. This is usually fast but since it *can* scan the whole ring, keeping the [`NumberId`] directly is better.
@@ -645,17 +663,13 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
 
     pub fn leave(&self, number: NumberId) -> Result<(), LeaveError> {
         let result = self.track().leave(number);
-        let (f, pinfo) = get_futex(self.track(), number.id);
-        f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f, pinfo);
+        self.signal(number);
         result
     }
 
     pub fn leave_concurrent(&self, number: NumberId) -> Result<(), LeaveError> {
         let result = self.track().leave_concurrent(number);
-        let (f, pinfo) = get_futex(self.track(), number.id);
-        f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f, pinfo);
+        self.signal(number);
         result
     }
 }
@@ -810,7 +824,7 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
     }
 
     /// # Safety
-    /// Callers must preserve monotonicity and must not set the suspended bit.
+    /// Same as [`Number::atomic`].
     /// Callers must proactively call [`signal_change`](`NumberWaiting::signal_change`) after changing the number.
     pub unsafe fn atomic(&self) -> &AtomicType {
         unsafe { self.inner.atomic() }

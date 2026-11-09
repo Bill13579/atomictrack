@@ -545,26 +545,13 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
         // This is only needed as a benchmark for the second loop to have an upper bound it can guarantee to not move min ahead of.
         // Thus, it only needs to ensure it looks at all active numbers when it runs.
         for slot in self.slots.iter() {
-            loop {
-                let id_before = slot.id.load(Ordering::Acquire);
-                let value = slot.value.load(Ordering::Acquire);
-                let id_after = slot.id.load(Ordering::Acquire);
-
-                if id_before != id_after {
-                    core::hint::spin_loop();
-                    continue;
-                }
-
+            let value = slot.value.load(Ordering::Acquire);
+            if !is_suspended(value) {
                 let number = value & Self::NUMBER_MASK;
-
-                if !is_suspended(value) && key_bits(id_before) != EMPTY_ID {
-                    active_max = Some(match active_max {
-                        Some(current) => max2_masked(current, number, Self::NUMBER_MASK),
-                        None => number,
-                    });
-                }
-
-                break;
+                active_max = Some(match active_max {
+                    Some(current) => max2_masked(current, number, Self::NUMBER_MASK),
+                    None => number,
+                });
             }
         }
 
@@ -581,50 +568,28 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
     pub fn find_min_bounded(&self, bound: NumericType) -> (NumericType, NumericType) {
         let mut running_min = bound & Self::NUMBER_MASK;
 
+        // As long as the value is always not suspended when it is actively participating in determining the min (like in
+        // the case of keeping data alive in a ring buffer), there's no need to check id at all here.
         'outer: for slot in self.slots.iter() {
-            'retry: loop {
-                let id_before = slot.id.load(Ordering::Acquire);
-                let mut current = slot.value.load(Ordering::Acquire);
+            let mut current = slot.value.load(Ordering::Acquire);
 
-                'inner: while is_suspended(current) {
-                    let current_value = current & Self::NUMBER_MASK;
-
-                    if gte_masked(current_value, running_min, Self::NUMBER_MASK) {
-                        let id_after = slot.id.load(Ordering::Acquire);
-                        if id_before != id_after {
-                            core::hint::spin_loop();
-                            continue 'retry;
-                        }
-
-                        continue 'outer;
-                    }
-
-                    match slot.value.compare_exchange(
-                        current,
-                        with_suspended_bit(running_min),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => continue 'outer,
-                        Err(actual) => {
-                            current = actual;
-                            continue 'inner;
-                        }
-                    }
+            while is_suspended(current) {
+                if gte_masked(current & Self::NUMBER_MASK, running_min, Self::NUMBER_MASK) {
+                    continue 'outer;
                 }
 
-                let id_after = slot.id.load(Ordering::Acquire);
-                if id_before != id_after {
-                    core::hint::spin_loop();
-                    continue 'retry;
+                match slot.value.compare_exchange(
+                    current,
+                    with_suspended_bit(running_min),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => continue 'outer,
+                    Err(actual) => current = actual,
                 }
-
-                if key_bits(id_before) != EMPTY_ID {
-                    running_min = min2_masked(running_min, current & Self::NUMBER_MASK, Self::NUMBER_MASK);
-                }
-
-                continue 'outer;
             }
+
+            running_min = min2_masked(running_min, current & Self::NUMBER_MASK, Self::NUMBER_MASK);
         }
 
         let mut current = self.min.load(Ordering::Relaxed);
@@ -784,7 +749,10 @@ impl<'a, const L: u32> Number<'a, L> {
     }
 
     /// # Safety
-    /// Callers must preserve monotonicity and must not set the suspended bit.
+    /// Callers must consider who else might be touching this number, in any way (including with provided functions like [`AtomicTrack::leave_concurrent`]).
+    /// In addition, keep in mind what the value must follow. The monotonically growing
+    /// part has to stay that way when changed manually, and the suspended bit has to be
+    /// considered as well.
     pub unsafe fn atomic(&self) -> &AtomicType {
         &self.slot.value
     }
@@ -858,7 +826,7 @@ mod tests {
         track.number(a).unwrap().raise_to(FLAG | 10).unwrap();
         track.number(b).unwrap().raise_to(FLAG | 7).unwrap();
 
-        assert_eq!(track.find_min(), 7);
+        assert_eq!(track.find_min(), (7, 0));
         assert_eq!(track.min(), 7);
 
         let c = track.enter(3).unwrap();
@@ -887,7 +855,7 @@ mod tests {
         let track: &AtomicTrack = &STATIC_TRACK;
         let number = track.enter(3).unwrap();
         assert_eq!(track.number(number).unwrap().raise_to(6), Ok(6));
-        assert_eq!(track.find_min(), 6);
+        assert_eq!(track.find_min(), (6, 0));
         track.leave(number).unwrap();
     }
 
@@ -929,7 +897,7 @@ mod tests {
             assert_eq!(cast.capacity(), 4);
             assert_eq!(cast.recover(3), Some(number));
             assert_eq!(cast.with_id(3, |lane| lane.get()).unwrap(), Ok(9));
-            assert_eq!(cast.find_min(), 9);
+            assert_eq!(cast.find_min(), (9, 0));
             assert_eq!(track.min(), 9);
 
             std::alloc::dealloc(ptr.as_ptr(), layout);
@@ -1066,11 +1034,11 @@ mod tests {
             .with_number(b, |lane| lane.raise_to(7).unwrap())
             .unwrap();
 
-        assert_eq!(track.find_min(), 7);
+        assert_eq!(track.find_min(), (7, 0));
         assert_eq!(track.min(), 7);
 
         track.with_number(b, |lane| lane.add(5).unwrap()).unwrap();
-        assert_eq!(track.find_min(), 10);
+        assert_eq!(track.find_min(), (10, 7));
         assert_eq!(track.min(), 10);
     }
 
@@ -1081,7 +1049,7 @@ mod tests {
         track
             .with_number(a, |lane| lane.raise_to(9).unwrap())
             .unwrap();
-        assert_eq!(track.find_min(), 9);
+        assert_eq!(track.find_min(), (9, 0));
 
         track.leave(a).unwrap();
         let b = track.enter(20).unwrap();
@@ -1103,7 +1071,7 @@ mod tests {
             .unwrap();
         track.leave(a).unwrap();
 
-        assert_eq!(track.find_min(), 0);
+        assert_eq!(track.find_min(), (0, 0));
         assert_eq!(track.min(), 0);
 
         let b = track.enter(2).unwrap();
@@ -1135,25 +1103,27 @@ mod tests {
         let track = ArrayAtomicTrack::<1>::new();
         let number = track.enter(1).unwrap();
         let quarter = NumericType::MAX / 4;
+        let mut previous = 0;
 
         for delta in [quarter, quarter, 1] {
             let value = track
                 .with_number(number, |lane| lane.add(delta).unwrap())
                 .unwrap();
-            assert_eq!(track.find_min(), value);
+            assert_eq!(track.find_min(), (value, previous));
             assert_eq!(track.min(), value);
+            previous = value;
         }
 
         assert_eq!(track.min(), MAX_PUBLIC);
         track.leave_concurrent(number).unwrap();
-        assert_eq!(track.find_min(), MAX_PUBLIC);
+        assert_eq!(track.find_min(), (MAX_PUBLIC, MAX_PUBLIC));
 
         let replacement = track.enter(2).unwrap();
         assert_eq!(
             track.with_number(replacement, |lane| lane.get()).unwrap(),
             Ok(0)
         );
-        assert_eq!(track.find_min(), 0);
+        assert_eq!(track.find_min(), (0, MAX_PUBLIC));
         assert_eq!(track.min(), 0);
     }
 
@@ -1162,12 +1132,14 @@ mod tests {
         let track = ArrayAtomicTrack::<1>::new();
         let number = track.enter(1).unwrap();
         let quarter = NumericType::MAX / 4;
+        let mut previous = 0;
 
         for delta in [quarter, quarter, 1] {
             let value = track
                 .with_number(number, |lane| lane.add(delta).unwrap())
                 .unwrap();
-            assert_eq!(track.find_min(), value);
+            assert_eq!(track.find_min(), (value, previous));
+            previous = value;
         }
 
         assert_eq!(track.min(), MAX_PUBLIC);
@@ -1175,7 +1147,7 @@ mod tests {
             track.with_number(number, |lane| lane.raise_to(1)).unwrap(),
             Ok(1)
         );
-        assert_eq!(track.find_min(), 1);
+        assert_eq!(track.find_min(), (1, MAX_PUBLIC));
         assert_eq!(track.min(), 1);
     }
 
@@ -1205,5 +1177,98 @@ mod tests {
             track.with_number(number, |lane| lane.get()).unwrap(),
             Err(NumberError::NotFound)
         );
+    }
+
+    #[test]
+    fn find_min_bounded_advances_without_active_lanes() {
+        let track = ArrayAtomicTrack::<4>::new();
+        assert_eq!(track.find_min_bounded(8), (8, 0));
+        assert_eq!(track.min(), 8);
+
+        // Suspended floors were dragged to the bound, so new entrants start there.
+        let a = track.enter(1).unwrap();
+        assert_eq!(track.number(a).unwrap().get(), Ok(8));
+    }
+
+    #[test]
+    fn find_min_bounded_ranges_dont_overlap() {
+        let track = ArrayAtomicTrack::<4>::new();
+        let a = track.enter(1).unwrap();
+        track.number(a).unwrap().raise_to(3).unwrap();
+
+        assert_eq!(track.find_min_bounded(8), (3, 0));
+        assert_eq!(track.find_min_bounded(8), (3, 3)); // nothing new
+        track.number(a).unwrap().raise_to(5).unwrap();
+        assert_eq!(track.find_min_bounded(4), (4, 3)); // bound
+        track.leave(a).unwrap();
+        assert_eq!(track.find_min_bounded(9), (9, 4));
+    }
+
+    #[test]
+    fn find_min_bounded_masks_the_bound() {
+        let track = ArrayAtomicTrack::<2>::new();
+        assert_eq!(track.find_min_bounded(SUSPENDED_BIT | 5), (5, 0));
+        assert_eq!(track.min(), 5);
+        let a = track.enter(1).unwrap(); // would be InvalidValue if min had picked up the MSB
+        assert_eq!(track.number(a).unwrap().get(), Ok(5));
+    }
+
+    #[test]
+    fn concurrent_find_min_bounded_ranges_tile_without_gaps_or_overlap() {
+        const THREADS: usize = 4;
+        let iterations = if cfg!(miri) { 50 } else { 20_000 };
+        let track = Arc::new(ArrayAtomicTrack::<4>::new());
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: std::vec::Vec<_> = (0..THREADS)
+            .map(|t| {
+                let (track, barrier) = (track.clone(), barrier.clone());
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut claimed = std::vec::Vec::new();
+                    for i in 0..iterations {
+                        let (new, previous) = track.find_min_bounded((i * THREADS + t) as NumericType);
+                        if new != previous {
+                            claimed.push((previous, new));
+                        }
+                    }
+                    claimed
+                })
+            })
+            .collect();
+        let mut ranges: std::vec::Vec<_> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        ranges.sort();
+        let mut cursor = 0;
+        for (previous, new) in ranges {
+            assert_eq!(previous, cursor, "gap or overlap");
+            cursor = new;
+        }
+        assert_eq!(cursor, track.min());
+    }
+
+    #[test]
+    fn enter_at_is_exact() {
+        let track = ArrayAtomicTrack::<2>::new();
+        let a = track.enter_at(1, 6).unwrap();
+        assert_eq!(track.number(a).unwrap().get(), Ok(6));
+        assert_eq!(track.find_min_bounded(10), (6, 0)); // capped by a
+        assert_eq!(track.enter_at(2, 4), Err(EnterError::ExactFailed)); // below min
+        // Slot 0 was scanned before a's slot, while running_min was still 10, so its floor is 10:
+        // floors are per slot, and an exact enter on an id is contingent on whichever empty slot enter found for the id and checked first.
+        assert_eq!(track.enter_at(2, 7), Err(EnterError::ExactFailed));
+        let b = track.enter_at(2, 10).unwrap();
+        assert_eq!(track.number(b).unwrap().get(), Ok(10));
+    }
+
+    #[test]
+    fn enter_at_releases_the_slot_it_rejects() {
+        let track = ArrayAtomicTrack::<1>::new();
+        let a = track.enter(1).unwrap();
+        track.number(a).unwrap().raise_to(100).unwrap();
+        track.leave(a).unwrap(); // floor 100, min still 0
+
+        assert_eq!(track.enter_at(2, 50), Err(EnterError::ExactFailed));
+        assert_eq!(track.recover(2), None);
+        let b = track.enter_at(2, 100).unwrap(); // not AlreadyPresent / Full since the slot was released
+        assert_eq!(track.number(b).unwrap().get(), Ok(100));
     }
 }
