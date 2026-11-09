@@ -50,7 +50,7 @@ pub mod futex;
 
 use MSB as SUSPENDED_BIT;
 
-use crate::math::{number_mask, gte_masked, is_valid_user_bit_low, max2_masked, max3_masked, min2_masked, user_mask};
+use crate::math::{gte_masked, is_valid_user_bit_low, max2_masked, max3_special_masked, min2_masked, number_mask, user_mask};
 
 const EMPTY_ID: NumericType = 0;
 const KEY_LOCK_BIT: NumericType = SUSPENDED_BIT;
@@ -188,6 +188,7 @@ pub enum EnterError {
     InvalidValue,
     AlreadyPresent,
     Full,
+    ExactFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +384,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
         self.__leave(number, true)
     }
 
+    #[inline(always)]
     fn __leave(&self, number: NumberId, __concurrent_write_leave: bool) -> Result<(), LeaveError> {
         let slot = match self.get_slot_concurrent(number) {
             Ok(slot) => slot,
@@ -432,7 +434,8 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
         }
     }
 
-    pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
+    #[inline(always)]
+    fn __enter_from(&self, id: NumericType, at_least: NumericType, __exact: bool) -> Result<NumberId, EnterError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(EnterError::InvalidId);
         }
@@ -462,15 +465,22 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
                     debug_assert!(is_suspended(current));
 
                     // Resume from max(current_lane_floor, global_min, at_least)
-                    let desired = {
-                        let three_way_max = max3_masked(
-                            without_suspended_bit(current),
-                            self.min.load(Ordering::Acquire),
-                            at_least,
-                            Self::NUMBER_MASK,
-                        );
-                        (three_way_max & Self::NUMBER_MASK) | I
-                    };
+                    let three_way_max = max3_special_masked(
+                        at_least,
+                        without_suspended_bit(current),
+                        self.min.load(Ordering::Acquire),
+                        __exact,
+                        Self::NUMBER_MASK,
+                    );
+
+                    let desired;
+                    if let Some(three_way_max) = three_way_max {
+                        desired = (three_way_max & Self::NUMBER_MASK) | I;
+                    } else {
+                        // Release the slot we locked since we're not using it
+                        slot.id.store(EMPTY_ID, Ordering::Release);
+                        return Err(EnterError::ExactFailed);
+                    }
 
                     // CAS to enter active state
                     match slot.value.compare_exchange(
@@ -495,6 +505,15 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
         Err(EnterError::Full)
     }
 
+    pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
+        self.__enter_from(id, at_least, false)
+    }
+
+    pub fn enter_at(&self, id: NumericType, at: NumericType) -> Result<NumberId, EnterError> {
+        self.__enter_from(id, at, true)
+    }
+
+    #[inline(always)]
     fn __recover(&self, id: NumericType) -> Option<(NumberId, bool)> {
         if id == EMPTY_ID || is_key_locked(id) {
             return None;
@@ -519,7 +538,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
         None
     }
 
-    pub fn find_min(&self) -> NumericType {
+    pub fn find_min(&self) -> (NumericType, NumericType) {
         let mut active_max: Option<NumericType> = None;
 
         // Goes through all slots to find the maximum active number.
@@ -549,14 +568,18 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
             }
         }
 
-        let mut running_min;
         if let Some(active_max) = active_max {
-            running_min = active_max;
+            self.find_min_bounded(active_max)
         } else {
             // If there are no active numbers at all, considering that we have to be wrapping-aware, we're just gonna return the current global min and not update it at all.
             // `find_min` is lazy that way.
-            return self.min.load(Ordering::Acquire);
+            let min = self.min.load(Ordering::Acquire);
+            return (min, min);
         }
+    }
+
+    pub fn find_min_bounded(&self, bound: NumericType) -> (NumericType, NumericType) {
+        let mut running_min = bound & Self::NUMBER_MASK;
 
         'outer: for slot in self.slots.iter() {
             'retry: loop {
@@ -620,7 +643,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
             }
         };
 
-        max2_masked(previous, running_min, Self::NUMBER_MASK)
+        (max2_masked(previous, running_min, Self::NUMBER_MASK), previous)
     }
 
     fn offset_as_usize(&self, offset: u64) -> Result<usize, NumberError> {

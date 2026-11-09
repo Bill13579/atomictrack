@@ -463,6 +463,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         Ok(futex::wait_timeout(f, expected, timeout_ns, pinfo))
     }
 
+    #[inline(always)]
     fn __wait_for_enter_timeout(&self, id: NumericType, timeout_ns: Option<(u64, Instant)>) -> Result<NumberId, WaitError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
@@ -525,6 +526,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         }
     }
 
+    #[inline(always)]
     fn __wait_for_enter_and_at_least_timeout(&self, id: NumericType, at_least: NumericType, expected_user_bits: Option<NumericType>, timeout_ns: Option<(u64, Instant)>) -> Result<(WaitGteStatus, NumericType, NumberId), WaitError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
@@ -719,6 +721,7 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
         futex::wait_timeout(f, expected, timeout_ns, pinfo)
     }
 
+    #[inline(always)]
     fn __wait_gte_timeout(&self, at_least: NumericType, expected_user_bits: Option<NumericType>, timeout_ns: Option<(u64, Instant)>) -> Result<(WaitGteStatus, NumericType), WaitError> {
         let mut i = 0;
         let mut f = None;

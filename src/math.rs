@@ -54,6 +54,11 @@ pub const fn lte_masked(a: NumericType, b: NumericType, mask: NumericType) -> bo
 }
 
 #[inline]
+pub const fn lt_masked(a: NumericType, b: NumericType, mask: NumericType) -> bool {
+    a.wrapping_sub(b) & mask > mask >> 1
+}
+
+#[inline]
 pub const fn max2_masked(a: NumericType, b: NumericType, mask: NumericType) -> NumericType {
     if gte_masked(b, a, mask) { b } else { a }
 }
@@ -66,6 +71,16 @@ pub const fn min2_masked(a: NumericType, b: NumericType, mask: NumericType) -> N
 #[inline]
 pub const fn max3_masked(a: NumericType, b: NumericType, c: NumericType, mask: NumericType) -> NumericType {
     max2_masked(max2_masked(a, b, mask), c, mask)
+}
+
+#[inline]
+pub const fn max3_special_masked(a: NumericType, b: NumericType, c: NumericType, special: bool, mask: NumericType) -> Option<NumericType> {
+    let bc = if gte_masked(b, c, mask) { b } else { c };
+    if lt_masked(a, bc, mask) {
+        if special { None } else { Some(bc) }
+    } else {
+        Some(a)
+    }
 }
 
 /// Wrapping-aware distance (a - b) between two numbers with MSB masked out, handling the case where `a` has wrapped past MAX but `b` hasn't.
