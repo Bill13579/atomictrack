@@ -588,7 +588,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
 
                 match slot.value.compare_exchange(
                     current,
-                    with_suspended_bit(running_min),
+                    with_suspended_bit(running_min | (current & user_mask(L))),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
