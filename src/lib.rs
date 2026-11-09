@@ -680,26 +680,36 @@ impl<'a, const L: u32> Number<'a, L> {
     }
 
     pub fn raise_to(&self, at_least: NumericType) -> Result<NumericType, NumberError> {
-        self.__raise_to(at_least, false, true)
+        self.__raise_to(at_least, false, true, true)
     }
 
     /// Try to [`raise_to`](`Number::raise_to`) at least the provided target, returning [`Err(NumberError::CasFailed)`](`NumberError::CasFailed`) immediately if the compare-exchange failed.
     pub fn try_raise_to(&self, at_least: NumericType) -> Result<NumericType, NumberError> {
-        self.__raise_to(at_least, false, false)
+        self.__raise_to(at_least, false, false, true)
     }
 
     /// Attempts to set the number to exactly `target`, with user bits set to the ones passed in only if *this* call is the one that got the number there. Fails with [`NumberError::PassedTarget(current)`](`NumberError::PassedTarget`) if it goes past the target due to concurrent changes, and [`Ok(current)`](`Ok`) with the new value returned if the target is reached, though user bits might differ if it was set by a different, concurrent call.
     pub fn set_to(&self, target: NumericType) -> Result<NumericType, NumberError> {
-        self.__raise_to(target, true, true)
+        self.__raise_to(target, true, true, true)
+    }
+
+    /// [`set_to`](`Number::set_to`) with user bits ignored
+    pub fn set_numeral(&self, target: NumericType) -> Result<NumericType, NumberError> {
+        self.__raise_to(target, true, true, false)
     }
 
     /// Try to [`set_to`](`Number::set_to`) the provided target, returning [`Err(NumberError::CasFailed)`](`NumberError::CasFailed`) immediately if the compare-exchange failed.
     pub fn try_set_to(&self, target: NumericType) -> Result<NumericType, NumberError> {
-        self.__raise_to(target, true, false)
+        self.__raise_to(target, true, false, true)
+    }
+
+    /// [`try_set_to`](`Number::try_set_to`) with user bits ignored
+    pub fn try_set_numeral(&self, target: NumericType) -> Result<NumericType, NumberError> {
+        self.__raise_to(target, true, false, false)
     }
 
     #[inline(always)]
-    fn __raise_to(&self, target: NumericType, __strict: bool, __retry: bool) -> Result<NumericType, NumberError> {
+    fn __raise_to(&self, target: NumericType, __strict: bool, __retry: bool, __set_user_bits: bool) -> Result<NumericType, NumberError> {
         debug_assert!(
             is_valid_public_value(target),
             "target must fit in the public number range"
@@ -733,7 +743,11 @@ impl<'a, const L: u32> Number<'a, L> {
             } else {
                 max2_masked(current & Self::NUMBER_MASK, target & Self::NUMBER_MASK, Self::NUMBER_MASK)
             };
-            let desired = number | (target & Self::USER_MASK);
+
+            let user_bits = if __set_user_bits { target } else { current }
+                & Self::USER_MASK;
+
+            let desired = number | user_bits;
             if desired == current {
                 return Ok(current);
             }
@@ -1387,6 +1401,22 @@ mod tests {
         assert_eq!(number.set_to(5), Ok(FLAG | 5)); // already at 5, so the user bits are left alone
         assert_eq!(number.set_to(7), Ok(7));
         assert_eq!(number.set_to(FLAG | 4), Err(NumberError::PassedTarget(7)));
+    }
+
+    #[test]
+    fn set_numeral_leaves_the_user_bits() {
+        let track = ArrayAtomicTrack::<1, ONE_USER_BIT>::new();
+        let number = track.number(track.enter(1).unwrap()).unwrap();
+        assert_eq!(number.set_to(FLAG | 5), Ok(FLAG | 5));
+        assert_eq!(number.set_numeral(7), Ok(FLAG | 7));
+        assert_eq!(number.set_numeral(7), Ok(FLAG | 7));
+        assert_eq!(number.set_to(9), Ok(9));
+        assert_eq!(number.set_numeral(FLAG | 12), Ok(12)); // the target's user bits are ignored too
+        assert_eq!(number.set_numeral(11), Err(NumberError::PassedTarget(12)));
+
+        assert_eq!(number.set_to(FLAG | 13), Ok(FLAG | 13));
+        assert_eq!(number.try_set_numeral(15), Ok(FLAG | 15));
+        assert_eq!(number.try_set_numeral(14), Err(NumberError::PassedTarget(FLAG | 15)));
     }
 
     #[test]

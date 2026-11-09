@@ -771,8 +771,20 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
         result
     }
 
+    pub fn set_numeral(&self, target: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.set_numeral(target);
+        self.signal_change();
+        result
+    }
+
     pub fn try_set_to(&self, target: NumericType) -> Result<NumericType, NumberError> {
         let result = self.inner.try_set_to(target);
+        self.signal_change();
+        result
+    }
+
+    pub fn try_set_numeral(&self, target: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.try_set_numeral(target);
         self.signal_change();
         result
     }
