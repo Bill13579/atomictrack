@@ -50,7 +50,7 @@ pub mod futex;
 
 use MSB as SUSPENDED_BIT;
 
-use crate::math::{gte_masked, is_valid_user_bit_low, max2_masked, max3_special_masked, min2_masked, number_mask, user_mask};
+use crate::math::{gte_masked, is_valid_user_bit_low, lt_masked, max2_masked, max3_special_masked, min2_masked, number_mask, user_mask};
 
 const EMPTY_ID: NumericType = 0;
 const KEY_LOCK_BIT: NumericType = SUSPENDED_BIT;
@@ -202,6 +202,10 @@ pub enum NumberError {
     InvalidId,
     InvalidOffset,
     NotFound,
+    /// Number already past the target ([`set_to`](`Number::set_to`)).
+    PassedTarget(NumericType),
+    /// A `try_*` lost on the compare-exchange to a concurrent change.
+    CasFailed,
 }
 
 pub struct Number<'a, const USER_BIT_LOW: u32 = { NumericType::BITS }> {
@@ -390,6 +394,8 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
             Ok(slot) => slot,
             Err(NumberError::InvalidOffset) => return Err(LeaveError::InvalidOffset),
             Err(NumberError::InvalidId) | Err(NumberError::NotFound) => return Err(LeaveError::NotFound),
+            // Only value updates return these.
+            Err(NumberError::PassedTarget(_)) | Err(NumberError::CasFailed) => unreachable!(),
         };
 
         loop {
@@ -672,9 +678,29 @@ impl<'a, const L: u32> Number<'a, L> {
     }
 
     pub fn raise_to(&self, at_least: NumericType) -> Result<NumericType, NumberError> {
+        self.__raise_to(at_least, false, true)
+    }
+
+    /// Try to [`raise_to`](`Number::raise_to`) at least the provided target, returning [`Err(NumberError::CasFailed)`](`NumberError::CasFailed`) immediately if the compare-exchange failed.
+    pub fn try_raise_to(&self, at_least: NumericType) -> Result<NumericType, NumberError> {
+        self.__raise_to(at_least, false, false)
+    }
+
+    /// Attempts to set the number to exactly `target`, with user bits set to the ones passed in only if *this* call is the one that got the number there. Fails with [`NumberError::PassedTarget(current)`](`NumberError::PassedTarget`) if it goes past the target due to concurrent changes, and [`Ok(current)`](`Ok`) with the new value returned if the target is reached, though user bits might differ if it was set by a different, concurrent call.
+    pub fn set_to(&self, target: NumericType) -> Result<NumericType, NumberError> {
+        self.__raise_to(target, true, true)
+    }
+
+    /// Try to [`set_to`](`Number::set_to`) the provided target, returning [`Err(NumberError::CasFailed)`](`NumberError::CasFailed`) immediately if the compare-exchange failed.
+    pub fn try_set_to(&self, target: NumericType) -> Result<NumericType, NumberError> {
+        self.__raise_to(target, true, false)
+    }
+
+    #[inline(always)]
+    fn __raise_to(&self, target: NumericType, __strict: bool, __retry: bool) -> Result<NumericType, NumberError> {
         debug_assert!(
-            is_valid_public_value(at_least),
-            "at_least must fit in the public number range"
+            is_valid_public_value(target),
+            "target must fit in the public number range"
         );
 
         loop {
@@ -688,13 +714,26 @@ impl<'a, const L: u32> Number<'a, L> {
                 return Err(NumberError::NotFound);
             }
 
-            let desired = max2_masked(current & Self::NUMBER_MASK, at_least & Self::NUMBER_MASK, Self::NUMBER_MASK)
-                | (at_least & Self::USER_MASK);
-
             let key_after = self.slot.id.load(Ordering::Acquire);
             if key_before != key_after {
                 core::hint::spin_loop();
                 continue;
+            }
+
+            let number = if __strict {
+                if lt_masked(target, current, Self::NUMBER_MASK) {
+                    return Err(NumberError::PassedTarget(current));
+                }
+                if current & Self::NUMBER_MASK == target & Self::NUMBER_MASK {
+                    return Ok(current);
+                }
+                target & Self::NUMBER_MASK
+            } else {
+                max2_masked(current & Self::NUMBER_MASK, target & Self::NUMBER_MASK, Self::NUMBER_MASK)
+            };
+            let desired = number | (target & Self::USER_MASK);
+            if desired == current {
+                return Ok(current);
             }
 
             match self.slot.value.compare_exchange(
@@ -704,10 +743,11 @@ impl<'a, const L: u32> Number<'a, L> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => return Ok(desired),
-                Err(_) => {
+                Err(_) if __retry => {
                     core::hint::spin_loop();
                     continue;
                 }
+                Err(_) => return Err(NumberError::CasFailed),
             }
         }
     }
@@ -753,7 +793,7 @@ impl<'a, const L: u32> Number<'a, L> {
     /// In addition, keep in mind what the value must follow. The monotonically growing
     /// part has to stay that way when changed manually, and the suspended bit has to be
     /// considered as well.
-    pub unsafe fn atomic(&self) -> &AtomicType {
+    pub unsafe fn atomic(&self) -> &'a AtomicType {
         &self.slot.value
     }
 }
@@ -1270,5 +1310,79 @@ mod tests {
         assert_eq!(track.recover(2), None);
         let b = track.enter_at(2, 100).unwrap(); // not AlreadyPresent / Full since the slot was released
         assert_eq!(track.number(b).unwrap().get(), Ok(100));
+    }
+
+    #[test]
+    fn set_to_is_exact_and_rejects_a_passed_target() {
+        let track = ArrayAtomicTrack::<2>::new();
+        let a = track.enter(1).unwrap();
+        let number = track.number(a).unwrap();
+
+        assert_eq!(number.set_to(5), Ok(5));
+        assert_eq!(number.set_to(5), Ok(5));
+        assert_eq!(number.set_to(3), Err(NumberError::PassedTarget(5)));
+        assert_eq!(number.get(), Ok(5));
+        assert_eq!(number.try_set_to(9), Ok(9));
+        assert_eq!(number.try_set_to(8), Err(NumberError::PassedTarget(9)));
+        assert_eq!(number.try_raise_to(4), Ok(9)); // raising should never lower
+        assert_eq!(number.try_raise_to(12), Ok(12));
+
+        track.leave(a).unwrap();
+        assert_eq!(number.set_to(20), Err(NumberError::NotFound));
+        assert_eq!(number.try_raise_to(20), Err(NumberError::NotFound));
+    }
+
+    #[test]
+    fn set_to_sets_the_user_bits_from_the_target_only_when_it_modifies() {
+        let track = ArrayAtomicTrack::<1, ONE_USER_BIT>::new();
+        let number = track.number(track.enter(1).unwrap()).unwrap();
+        assert_eq!(number.set_to(FLAG | 5), Ok(FLAG | 5));
+        assert_eq!(number.set_to(5), Ok(FLAG | 5)); // already at 5, so the user bits are left alone
+        assert_eq!(number.set_to(7), Ok(7));
+        assert_eq!(number.set_to(FLAG | 4), Err(NumberError::PassedTarget(7)));
+    }
+
+    #[test]
+    fn try_updates_only_fail_on_contention_and_set_to_retries_through_it() {
+        const ROUNDS: NumericType = if cfg!(miri) { 50 } else { 20_000 };
+        let track = ArrayAtomicTrack::<2>::new();
+        let a = track.enter(1).unwrap();
+        let b = track.enter(2).unwrap();
+        let track = &track;
+
+        thread::scope(|s| {
+            // `a`: one thread keeps adding while another makes single no-op attempts that can only lose the CAS.
+            s.spawn(move || {
+                let number = track.number(a).unwrap();
+                for _ in 0..ROUNDS {
+                    number.add(1).unwrap();
+                }
+            });
+            s.spawn(move || {
+                let number = track.number(a).unwrap();
+                for _ in 0..ROUNDS {
+                    match number.try_raise_to(0) {
+                        Ok(_) | Err(NumberError::CasFailed) => {},
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+            });
+            // `b`: two threads race to set interleaved targets.
+            for parity in 0..2 {
+                s.spawn(move || {
+                    let number = track.number(b).unwrap();
+                    for target in (parity..ROUNDS).step_by(2) {
+                        match number.set_to(target) {
+                            Ok(value) => assert_eq!(value, target),
+                            Err(NumberError::PassedTarget(_)) => {},
+                            other => panic!("unexpected {other:?}"),
+                        }
+                    }
+                });
+            }
+        });
+
+        assert_eq!(track.number(a).unwrap().get(), Ok(ROUNDS));
+        assert_eq!(track.number(b).unwrap().get(), Ok(ROUNDS - 1));
     }
 }

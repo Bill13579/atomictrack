@@ -197,6 +197,13 @@ fn signal_futex(f: &AtomicU32, pinfo: u128) {
     }
 }
 
+/// Whether a signal on this futex right now would wake someone.
+#[inline]
+fn signal_would_wake(f: &AtomicU32) -> bool {
+    fence(Ordering::SeqCst);
+    f.load(Ordering::Relaxed) & HAS_WAITING_THREADS != 0
+}
+
 /// Sleeping side, which arms the futex value and returns that armed value for this side to wait on.
 #[inline]
 fn arm_futex(f: &AtomicU32) -> u32 {
@@ -442,6 +449,8 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             Err(NumberError::InvalidId) | Err(NumberError::InvalidOffset) => unreachable!(),
             // get_slot_concurrent, and by extension `number` is just an indexing operation, they never return a NotFound error since NotFound checks additionally for whether the slot contains the actual id key.
             Err(NumberError::NotFound) => unreachable!(),
+            // Only value updates return these.
+            Err(NumberError::PassedTarget(_)) | Err(NumberError::CasFailed) => unreachable!(),
         }
     }
 
@@ -456,6 +465,8 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             Err(NumberError::InvalidId) | Err(NumberError::InvalidOffset) => unreachable!(),
             // get_slot_concurrent, and by extension `number` is just an indexing operation, they never return a NotFound error since NotFound checks additionally for whether the slot contains the actual id key.
             Err(NumberError::NotFound) => unreachable!(),
+            // Only value updates return these.
+            Err(NumberError::PassedTarget(_)) | Err(NumberError::CasFailed) => unreachable!(),
         }
     }
 
@@ -491,6 +502,14 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             return Err(WaitError::InvalidId);
         }
         Ok(arm_futex(get_futex(self.track(), id).0))
+    }
+
+    /// Whether a signal right now would wake *anyone* (any target, including unrelated ones that might only happen to share a futex in the waiting pool and are waiting for different reasons).
+    pub fn signal_would_wake(&self, id: NumericType) -> Result<bool, WaitError> {
+        if id == EMPTY_ID || is_key_locked(id) {
+            return Err(WaitError::InvalidId);
+        }
+        Ok(signal_would_wake(get_futex(self.track(), id).0))
     }
 
     /// Sleeps while the futex word for `id` still equals `expected`. Can return spuriously, especially since the number of futexes is fixed and futexes are shared with other ids.
@@ -722,6 +741,24 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
         result
     }
 
+    pub fn try_raise_to(&self, at_least: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.try_raise_to(at_least);
+        self.signal_change();
+        result
+    }
+
+    pub fn set_to(&self, target: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.set_to(target);
+        self.signal_change();
+        result
+    }
+
+    pub fn try_set_to(&self, target: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.try_set_to(target);
+        self.signal_change();
+        result
+    }
+
     pub fn signal_change(&self) {
         let (f, pinfo) = get_futex(self.atomic_track_waiting.track(), self.inner.id);
         signal_futex(f, pinfo);
@@ -751,6 +788,11 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
     /// See [`AtomicTrackWaiting::arm_futex`].
     pub fn arm_futex(&self) -> u32 {
         arm_futex(get_futex(self.atomic_track_waiting.track(), self.inner.id).0)
+    }
+
+    /// See [`AtomicTrackWaiting::signal_would_wake`].
+    pub fn signal_would_wake(&self) -> bool {
+        signal_would_wake(get_futex(self.atomic_track_waiting.track(), self.inner.id).0)
     }
 
     /// See [`AtomicTrackWaiting::wait_spurious`].
@@ -856,7 +898,7 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
     /// # Safety
     /// Same as [`Number::atomic`].
     /// Callers must proactively call [`signal_change`](`NumberWaiting::signal_change`) after changing the number.
-    pub unsafe fn atomic(&self) -> &AtomicType {
+    pub unsafe fn atomic(&self) -> &'a AtomicType {
         unsafe { self.inner.atomic() }
     }
 }
@@ -1048,6 +1090,38 @@ mod tests {
 
         assert_eq!(receiver.recv_timeout(TEST_WATCHDOG).expect("hand-rolled wait did not wake"), 5);
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn signal_would_wake_sees_an_armed_futex_until_a_signal_resolves_it() {
+        let track = AtomicTrackWaiting::new_default(4);
+        let number_id = track.enter(3).unwrap();
+        let number = track.number(number_id).unwrap();
+        let (f, _) = get_futex(track.track(), 3);
+
+        let armed = number.arm_futex();
+        // The pool is shared, so an unrelated signal may already have resolved it, but then the word moved on.
+        assert!(number.signal_would_wake() || f.load(Ordering::Relaxed) != armed);
+        assert!(track.signal_would_wake(3).unwrap() || f.load(Ordering::Relaxed) != armed);
+
+        number.signal_change();
+        assert_ne!(f.load(Ordering::Relaxed), armed, "the signal resolved the armed wait");
+        assert_eq!(track.signal_would_wake(EMPTY_ID), Err(WaitError::InvalidId));
+        assert_eq!(track.signal_would_wake(MSB | 3), Err(WaitError::InvalidId));
+    }
+
+    #[test]
+    fn set_to_wakes_a_waiter() {
+        let track = AtomicTrackWaiting::new_default(4);
+        let number_id = track.enter(3).unwrap();
+        let waiter_track = track.clone();
+        let waiter = thread::spawn(move || waiter_track.number(number_id).unwrap().wait_gte_timeout(5, TEST_TIMEOUT_NS));
+
+        thread::sleep(Duration::from_millis(10));
+        let number = track.number(number_id).unwrap();
+        assert_eq!(number.set_to(5), Ok(5));
+        assert_eq!(number.set_to(4), Err(NumberError::PassedTarget(5)));
+        assert_eq!(waiter.join().unwrap(), Ok((true, 5)));
     }
 
     /// Two threads alternate, each one raising a single number and then sleeping until the other one catches up. With the manual
