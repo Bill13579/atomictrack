@@ -741,8 +741,20 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
         result
     }
 
+    pub fn adds(&self, delta: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.adds(delta);
+        self.signal_change();
+        result
+    }
+
     pub fn add_within(&self, delta: NumericType, limit: NumericType) -> Result<NumericType, NumberError> {
         let result = self.inner.add_within(delta, limit);
+        self.signal_change();
+        result
+    }
+
+    pub fn adds_within(&self, delta: NumericType, limit: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.adds_within(delta, limit);
         self.signal_change();
         result
     }
@@ -981,7 +993,7 @@ mod tests {
         let number = track.number(number_id).unwrap();
         number.add(5).unwrap();
         thread::sleep(Duration::from_millis(10));
-        number.add(FLAG).unwrap();
+        number.adds(FLAG).unwrap();
 
         assert_eq!(waiter.join().unwrap(), Ok((WaitGteStatus::ReservedBitsModified, FLAG | 5)));
         assert_eq!(number.wait_gte_timeout_sicrbm(100, FLAG, 0), Ok((WaitGteStatus::TimedOut, FLAG | 5)));
@@ -995,7 +1007,7 @@ mod tests {
         let number_id = track.enter(3).unwrap();
         let number = track.number(number_id).unwrap();
         let seen = number.get().unwrap();
-        number.add(FLAG).unwrap();
+        number.adds(FLAG).unwrap();
 
         assert_eq!(number.wait_gte_sicrbm(100, seen), Ok((WaitGteStatus::ReservedBitsModified, FLAG)));
         assert_eq!(track.wait_gte_sicrbm(3, 100, seen), Ok((WaitGteStatus::ReservedBitsModified, FLAG, number_id)));

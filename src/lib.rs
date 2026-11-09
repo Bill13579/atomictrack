@@ -754,18 +754,30 @@ impl<'a, const L: u32> Number<'a, L> {
         }
     }
 
+    /// Adds `delta` to the number.
     pub fn add(&self, delta: NumericType) -> Result<NumericType, NumberError> {
-        self.__add(delta, None)
+        self.__add(delta, None, false)
+    }
+
+    /// Adds `delta` to the number, setting user bits.
+    pub fn adds(&self, delta: NumericType) -> Result<NumericType, NumberError> {
+        self.__add(delta, None, true)
     }
 
     /// Adds `delta` if the number would be equal to or less than the `limit` after the addition, failing with
     /// [`NumberError::Exceeded(current)`](`NumberError::Exceeded`) otherwise.
     pub fn add_within(&self, delta: NumericType, limit: NumericType) -> Result<NumericType, NumberError> {
-        self.__add(delta, Some(limit))
+        self.__add(delta, Some(limit), false)
+    }
+
+    /// Adds `delta` if the number would be equal to or less than the `limit` after the addition, failing with
+    /// [`NumberError::Exceeded(current)`](`NumberError::Exceeded`) otherwise, setting user bits.
+    pub fn adds_within(&self, delta: NumericType, limit: NumericType) -> Result<NumericType, NumberError> {
+        self.__add(delta, Some(limit), true)
     }
 
     #[inline(always)]
-    fn __add(&self, delta: NumericType, limit: Option<NumericType>) -> Result<NumericType, NumberError> {
+    fn __add(&self, delta: NumericType, limit: Option<NumericType>, __set_user_bits: bool) -> Result<NumericType, NumberError> {
         loop {
             let key_before = self.slot.id.load(Ordering::Acquire);
             if key_before != self.id {
@@ -790,8 +802,10 @@ impl<'a, const L: u32> Number<'a, L> {
                 }
             }
 
-            let next = (current.wrapping_add(delta) & Self::NUMBER_MASK)
-                | (delta & Self::USER_MASK);
+            let user_bits = if __set_user_bits { delta } else { current }
+                & Self::USER_MASK;
+
+            let next = (current.wrapping_add(delta) & Self::NUMBER_MASK) | user_bits;
 
             match self.slot.value.compare_exchange(
                 current,
@@ -843,7 +857,7 @@ mod tests {
         let a = track.enter(1).unwrap();
         let number = track.number(a).unwrap();
         assert_eq!(number.get(), Ok(FLAG));
-        assert_eq!(number.add(7), Ok(7));
+        assert_eq!(number.adds(7), Ok(7));
         track.leave(a).unwrap();
 
         let b = track.enter(2).unwrap();
@@ -864,18 +878,31 @@ mod tests {
     }
 
     #[test]
-    fn add_overwrites_user_bits_and_never_carries_the_counter_into_them() {
+    fn adds_overwrites_user_bits_and_never_carries_the_counter_into_them() {
         let track = ArrayAtomicTrack::<1, TWO_USER_BITS, LOWER_FLAG_OF_TWO>::new();
         let counter = number_mask(TWO_USER_BITS);
         let high = LOWER_FLAG_OF_TWO << 1;
         let number_id = track.enter(1).unwrap();
         let number = track.number(number_id).unwrap();
 
-        assert_eq!(number.add(high | counter), Ok(high | counter));
-        assert_eq!(number.add(high | 1), Ok(high));
-        assert_eq!(number.add(LOWER_FLAG_OF_TWO | 5), Ok(LOWER_FLAG_OF_TWO | 5));
-        assert_eq!(number.add(high | LOWER_FLAG_OF_TWO), Ok(high | LOWER_FLAG_OF_TWO | 5));
-        assert_eq!(number.add(0), Ok(5));
+        assert_eq!(number.adds(high | counter), Ok(high | counter));
+        assert_eq!(number.adds(high | 1), Ok(high));
+        assert_eq!(number.adds(LOWER_FLAG_OF_TWO | 5), Ok(LOWER_FLAG_OF_TWO | 5));
+        assert_eq!(number.adds(high | LOWER_FLAG_OF_TWO), Ok(high | LOWER_FLAG_OF_TWO | 5));
+        assert_eq!(number.adds(0), Ok(5));
+    }
+
+    #[test]
+    fn add_leaves_user_bits() {
+        let track = ArrayAtomicTrack::<1, TWO_USER_BITS, LOWER_FLAG_OF_TWO>::new();
+        let counter = number_mask(TWO_USER_BITS);
+        let high = LOWER_FLAG_OF_TWO << 1;
+        let number_id = track.enter(1).unwrap();
+        let number = track.number(number_id).unwrap();
+
+        assert_eq!(number.add(counter), Ok(LOWER_FLAG_OF_TWO | counter));
+        assert_eq!(number.add(1), Ok(LOWER_FLAG_OF_TWO)); // wraps within the counter
+        assert_eq!(number.add(high | 5), Ok(LOWER_FLAG_OF_TWO | 5)); // delta's user bits are ignored
     }
 
     #[test]
@@ -903,7 +930,7 @@ mod tests {
             assert_eq!(track.number(number_id).unwrap().get(), Ok(FLAG));
 
             let cast: &AtomicTrack<_, ONE_USER_BIT, FLAG> = AtomicTrack::from_raw(ptr, 2);
-            assert_eq!(cast.number(number_id).unwrap().add(0), Ok(0));
+            assert_eq!(cast.number(number_id).unwrap().adds(0), Ok(0));
             assert_eq!(track.number(number_id).unwrap().get(), Ok(0));
 
             std::alloc::dealloc(ptr.as_ptr(), layout);
@@ -1420,12 +1447,14 @@ mod tests {
     }
 
     #[test]
-    fn add_within_takes_the_user_bits_from_delta() {
+    fn add_within_leaves_user_bits_and_adds_within_sets_them() {
         let track = ArrayAtomicTrack::<1, ONE_USER_BIT>::new();
         let number = track.number(track.enter(1).unwrap()).unwrap();
-        assert_eq!(number.add_within(FLAG | 4, 10), Ok(FLAG | 4));
-        assert_eq!(number.add_within(1, 10), Ok(5));
-        assert_eq!(number.add_within(FLAG | 6, 10), Err(NumberError::Exceeded(5)));
+        assert_eq!(number.adds_within(FLAG | 4, 10), Ok(FLAG | 4));
+        assert_eq!(number.add_within(1, 10), Ok(FLAG | 5));
+        assert_eq!(number.adds_within(1, 10), Ok(6));
+        assert_eq!(number.add_within(FLAG | 2, 10), Ok(8));
+        assert_eq!(number.adds_within(FLAG | 3, 10), Err(NumberError::Exceeded(8)));
     }
 
     #[test]
