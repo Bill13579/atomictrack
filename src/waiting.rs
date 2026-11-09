@@ -8,15 +8,13 @@
 //! - All key-based (and not [`NumberId`] based) apis select and operate on ***only*** the first `Number` recovered from the ring with the provided id.
 //! - `at_least` is not checked for the reserved MSB bit. Please don't use numbers that are that high.
 
-//TODO: raise_to, add, and both leave methods notify even on errors or no-op updates. With wake_all and a shared futex pool, this can create wake storms. Change eventually if that becomes a problem.
-
 #[cfg(feature = "std")]
 extern crate std;
 
 #[cfg(feature = "std")]
 use std::time::Instant;
 
-use core::{alloc::Layout, hash::Hasher, ptr::{self, NonNull}, sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering}};
+use core::{alloc::Layout, hash::Hasher, ptr::{self, NonNull}, sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering, fence}};
 
 #[cfg(feature = "std")]
 use std::boxed::Box;
@@ -176,6 +174,35 @@ fn get_futex<const L: u32, const I: NumericType>(track: &AtomicTrack<[CachePadde
     #[allow(clippy::unnecessary_cast)]
     hasher.write(&(id as u64).to_le_bytes());
     futex(hasher.finish() as usize)
+}
+
+/// A thread that wants to wait bumps the futex word up to an odd value (bitwise OR bit 0 with 1), which means that there
+/// is at least one waiting thread. Wake happens then, and bumps the value up to even again, meaning resolved.
+const HAS_WAITING_THREADS: u32 = 1;
+
+/// Wakes all threads waiting on this futex, if there are any.
+#[inline]
+fn signal_futex(f: &AtomicU32, pinfo: u128) {
+    fence(Ordering::SeqCst);
+    let mut futex_value = f.load(Ordering::Relaxed);
+    while futex_value & HAS_WAITING_THREADS != 0 {
+        // Odd value bumped up to the next even value = resolved that batch of waits
+        match f.compare_exchange_weak(futex_value, futex_value.wrapping_add(1), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                let _ = futex::wake_all(f, pinfo);
+                return;
+            },
+            Err(actual) => futex_value = actual,
+        }
+    }
+}
+
+/// Sleeping side, which arms the futex value and returns that armed value for this side to wait on.
+#[inline]
+fn arm_futex(f: &AtomicU32) -> u32 {
+    let armed_wait_value = f.fetch_or(HAS_WAITING_THREADS, Ordering::Relaxed) | HAS_WAITING_THREADS;
+    fence(Ordering::SeqCst);
+    armed_wait_value
 }
 
 /// For convenience, a stable hash that gives you an id from a string name.
@@ -354,8 +381,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
     #[inline]
     fn signal(&self, number: NumberId) {
         let (f, pinfo) = get_futex(self.track(), number.id);
-        f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f, pinfo);
+        signal_futex(f, pinfo);
     }
 
     /// Recover a [`NumberId`] from a key. This is usually fast but since it *can* scan the whole ring, keeping the [`NumberId`] directly is better.
@@ -454,12 +480,17 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         self.__wait_for_enter_and_at_least_timeout(id, at_least, Some(expected_user_bits), Some((timeout_ns, Instant::now())))
     }
 
-    /// Loads the current futex word for `id`. Check your own condition, then pass this loaded value to [`wait_spurious`](`AtomicTrackWaiting::wait_spurious`) if you still need to wait. Any signal on `id` after the load makes the wait return immediately, including spuriously.
-    pub fn futex_word_value(&self, id: NumericType) -> Result<u32, WaitError> {
+    /// Arms the futex word for `id` and returns the armed value. Check your own condition after this, then pass the returned
+    /// value to [`wait_spurious`](`AtomicTrackWaiting::wait_spurious`) if you still need to wait. Any signal on `id`
+    /// after this makes the wait return immediately, including spuriously.
+    ///
+    /// Signals are skipped completely if the futex wasn't armed, and the futex gets unarmed on a signaling. Because of this, arming without
+    /// signaling just creates additional spurious wakes.
+    pub fn arm_futex(&self, id: NumericType) -> Result<u32, WaitError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(WaitError::InvalidId);
         }
-        Ok(get_futex(self.track(), id).0.load(Ordering::Acquire))
+        Ok(arm_futex(get_futex(self.track(), id).0))
     }
 
     /// Sleeps while the futex word for `id` still equals `expected`. Can return spuriously, especially since the number of futexes is fixed and futexes are shared with other ids.
@@ -492,7 +523,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
         let futex_getter = || get_futex(self.track(), id);
         loop {
             if i >= MAX_LOOPS_BEFORE_SLEEP {
-                futex_value_before = f.get_or_insert_with(&futex_getter).0.load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
+                futex_value_before = arm_futex(f.get_or_insert_with(&futex_getter).0); // Arm the futex and get the armed value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
             //NOTE: `recover` returns None and stops probing if it finds a slot with the right key but that is still locked, but this is fine because if it's locked it should soon be unlocked, at which point the thread that finished adding in the id to the slot will wake this thread up again, and it will recheck, and recover will then find it this time, so given the contract of finding whatever was the first to be found in the ring with the provided id, this is good.
@@ -558,7 +589,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             let mut value = None;
 
             if i >= MAX_LOOPS_BEFORE_SLEEP {
-                futex_value_before = f.get_or_insert_with(&futex_getter).0.load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
+                futex_value_before = arm_futex(f.get_or_insert_with(&futex_getter).0); // Arm the futex and get the armed value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
             if number.is_none() {
@@ -693,8 +724,7 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
 
     pub fn signal_change(&self) {
         let (f, pinfo) = get_futex(self.atomic_track_waiting.track(), self.inner.id);
-        f.fetch_add(1, Ordering::Release);
-        let _ = futex::wake_all(f, pinfo);
+        signal_futex(f, pinfo);
     }
 
     pub fn wait_gte(&self, at_least: NumericType) -> Result<NumericType, WaitError> {
@@ -718,9 +748,9 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
         self.__wait_gte_timeout(at_least, Some(expected_user_bits), Some((timeout_ns, Instant::now())))
     }
 
-    /// See [`AtomicTrackWaiting::futex_word_value`].
-    pub fn futex_word_value(&self) -> u32 {
-        get_futex(self.atomic_track_waiting.track(), self.inner.id).0.load(Ordering::Acquire)
+    /// See [`AtomicTrackWaiting::arm_futex`].
+    pub fn arm_futex(&self) -> u32 {
+        arm_futex(get_futex(self.atomic_track_waiting.track(), self.inner.id).0)
     }
 
     /// See [`AtomicTrackWaiting::wait_spurious`].
@@ -745,7 +775,7 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
             let mut value;
 
             if i >= MAX_LOOPS_BEFORE_SLEEP {
-                futex_value_before = f.get_or_insert_with(&futex_getter).0.load(Ordering::Acquire); // Get the futex value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
+                futex_value_before = arm_futex(f.get_or_insert_with(&futex_getter).0); // Arm the futex and get the armed value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
             loop {
@@ -971,9 +1001,9 @@ mod tests {
     fn wait_spurious_returns_immediately_after_a_signal_since_the_load() {
         let track = AtomicTrackWaiting::new_default(4);
         let number_id = track.enter(3).unwrap();
-        let word = track.futex_word_value(3).unwrap();
+        let word = track.arm_futex(3).unwrap();
         let number = track.number(number_id).unwrap();
-        let number_word = number.futex_word_value();
+        let number_word = number.arm_futex();
         assert_eq!(word, number_word);
         number.add(1).unwrap();
 
@@ -985,7 +1015,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
 
         let started = Instant::now();
-        while number.wait_spurious_timeout(number.futex_word_value(), 1_000_000) {
+        while number.wait_spurious_timeout(number.arm_futex(), 1_000_000) {
             assert!(started.elapsed() < TEST_WATCHDOG, "a fresh load never led to a timed out wait");
         }
     }
@@ -1002,7 +1032,7 @@ mod tests {
             let number = waiter_track.number(number_id).unwrap();
             waiter_barrier.wait();
             loop {
-                let word = number.futex_word_value();
+                let word = number.arm_futex();
                 let value = number.get().unwrap();
                 if value >= 5 {
                     sender.send(value).unwrap();
@@ -1018,6 +1048,54 @@ mod tests {
 
         assert_eq!(receiver.recv_timeout(TEST_WATCHDOG).expect("hand-rolled wait did not wake"), 5);
         waiter.join().unwrap();
+    }
+
+    /// Two threads alternate, each one raising a single number and then sleeping until the other one catches up. With the manual
+    /// loop there's no spinning, so (nearly) every round really goes to sleep, and a single missed wake would hang it.
+    ///
+    /// The numbers are raised with a plain store + `signal_change`, so it's the signalling side's fence that orders the
+    /// change before the armed check, not a CAS that happens to be a full barrier on x86 (like `raise_to`).
+    #[test]
+    fn prepare_wait_ping_pong_never_misses_a_wake() {
+        const ROUNDS: NumericType = if cfg!(miri) { 20 } else { 50_000 };
+
+        fn wait_until_gte<const L: u32, const I: NumericType>(number: &NumberWaiting<'_, '_, L, I>, target: NumericType) {
+            loop {
+                let word = number.arm_futex();
+                if number.get().unwrap() >= target {
+                    return;
+                }
+                number.wait_spurious(word);
+            }
+        }
+
+        let track = AtomicTrackWaiting::new_default(4);
+        let ping = track.enter(1).unwrap();
+        let pong = track.enter(2).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let other_track = track.clone();
+        let other = thread::spawn(move || {
+            let (ping, pong) = (other_track.number(ping).unwrap(), other_track.number(pong).unwrap());
+            for i in 1..=ROUNDS {
+                wait_until_gte(&ping, i);
+                // SAFETY: only this thread writes `pong`, monotonically, while it's entered.
+                unsafe { pong.atomic() }.store(i, Ordering::Release);
+                pong.signal_change();
+            }
+        });
+        thread::spawn(move || {
+            let (ping, pong) = (track.number(ping).unwrap(), track.number(pong).unwrap());
+            for i in 1..=ROUNDS {
+                // SAFETY: only this thread writes `ping`, monotonically, while it's entered.
+                unsafe { ping.atomic() }.store(i, Ordering::Release);
+                ping.signal_change();
+                wait_until_gte(&pong, i);
+            }
+            sender.send(()).unwrap();
+        });
+
+        receiver.recv_timeout(Duration::from_secs(60)).expect("missed wake: ping-pong stalled");
+        other.join().unwrap();
     }
 
     #[test]
@@ -1205,11 +1283,11 @@ mod tests {
     }
 
     #[test]
-    fn futex_word_value_and_wait_spurious_validate_ids() {
+    fn prepare_wait_and_wait_spurious_validate_ids() {
         let track = AtomicTrackWaiting::new_default(4);
-        let word = track.futex_word_value(3).unwrap();
-        assert_eq!(track.futex_word_value(EMPTY_ID), Err(WaitError::InvalidId));
-        assert_eq!(track.futex_word_value(MSB | 3), Err(WaitError::InvalidId));
+        let word = track.arm_futex(3).unwrap();
+        assert_eq!(track.arm_futex(EMPTY_ID), Err(WaitError::InvalidId));
+        assert_eq!(track.arm_futex(MSB | 3), Err(WaitError::InvalidId));
         assert_eq!(track.wait_spurious(EMPTY_ID, word), Err(WaitError::InvalidId));
         assert_eq!(track.wait_spurious_timeout(MSB | 3, word, 0), Err(WaitError::InvalidId));
     }
