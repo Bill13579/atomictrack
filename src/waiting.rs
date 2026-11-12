@@ -262,6 +262,7 @@ unsafe impl<const L: u32, const I: NumericType> Sync for AtomicTrackWaiting<L, I
 pub enum WaitError {
     InvalidId,
     NotFound,
+    Suspended,
 }
 
 #[repr(C)]
@@ -628,26 +629,12 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             }
 
             if let Some((number, number_id)) = &number {
-                let mut value_tmp;
-
-                loop {
-                    let key_before = number.inner.slot.id.load(Ordering::Acquire);
-                    if key_before != number.inner.id {
-                        return Err(WaitError::NotFound);
-                    }
-
-                    value_tmp = number.inner.slot.value.load(Ordering::Acquire);
-                    let key_after = number.inner.slot.id.load(Ordering::Acquire);
-                    if key_before != key_after {
-                        core::hint::spin_loop();
-                        continue;
-                    }
-
-                    break;
-                }
+                let Ok(value_tmp) = number.inner.get_value() else {
+                    return Err(WaitError::NotFound);
+                };
 
                 if is_suspended(value_tmp) {
-                    return Err(WaitError::NotFound);
+                    return Err(WaitError::Suspended);
                 }
 
                 // Check if value is gte at_least.
@@ -877,30 +864,16 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
         let mut futex_value_before = 0;
         let futex_getter = || get_futex(self.atomic_track_waiting.track(), self.inner.id);
         loop {
-            let mut value;
-
             if i >= MAX_LOOPS_BEFORE_SLEEP {
                 futex_value_before = arm_futex(f.get_or_insert_with(&futex_getter).0); // Arm the futex and get the armed value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
-            loop {
-                let key_before = self.inner.slot.id.load(Ordering::Acquire);
-                if key_before != self.inner.id {
-                    return Err(WaitError::NotFound);
-                }
-
-                value = self.inner.slot.value.load(Ordering::Acquire);
-                let key_after = self.inner.slot.id.load(Ordering::Acquire);
-                if key_before != key_after {
-                    core::hint::spin_loop();
-                    continue;
-                }
-
-                break;
-            }
+            let Ok(value) = self.inner.get_value() else {
+                return Err(WaitError::NotFound);
+            };
 
             if is_suspended(value) {
-                return Err(WaitError::NotFound);
+                return Err(WaitError::Suspended);
             }
 
             // Check if value is gte at_least.
@@ -1661,6 +1634,39 @@ mod tests {
         track.leave(number_id).unwrap();
 
         assert_eq!(waiter.join().unwrap(), Err(WaitError::NotFound));
+    }
+
+    #[test]
+    fn waits_on_a_suspended_lane_return_suspended() {
+        let track = AtomicTrackWaiting::new_default(1);
+        let number_id = track.enter(11).unwrap();
+        let number = track.number(number_id).unwrap();
+        number.suspend().unwrap();
+
+        // Suspended is different from left entirely.
+        assert_eq!(track.wait_for_timeout(11, 0), Ok(number_id));
+        assert_eq!(track.wait_gte_timeout(11, 1, 0), Err(WaitError::Suspended));
+        assert_eq!(number.wait_gte_timeout(1, 0), Err(WaitError::Suspended));
+    }
+
+    #[test]
+    fn number_wait_is_woken_when_the_lane_suspends() {
+        let track = AtomicTrackWaiting::new_default(1);
+        let number_id = track.enter(11).unwrap();
+        let waiter_track = track.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter_barrier = Arc::clone(&barrier);
+        let waiter = thread::spawn(move || {
+            let number = waiter_track.number(number_id).unwrap();
+            waiter_barrier.wait();
+            number.wait_gte_timeout(1, TEST_TIMEOUT_NS)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+        track.number(number_id).unwrap().suspend().unwrap();
+
+        assert_eq!(waiter.join().unwrap(), Err(WaitError::Suspended));
     }
 
     #[test]
