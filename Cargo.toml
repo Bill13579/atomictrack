@@ -11,6 +11,7 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["no_std"]
 categories = ["algorithms", "concurrency", "data-structures"]
+exclude = ["scripts/"]
 
 [features]
 default = []
