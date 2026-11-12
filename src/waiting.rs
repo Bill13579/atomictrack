@@ -192,7 +192,10 @@ fn signal_futex(f: &AtomicU32, pinfo: u128) {
                 let _ = futex::wake_all(f, pinfo);
                 return;
             },
-            Err(actual) => futex_value = actual,
+            Err(actual) => {
+                futex_value = actual;
+                core::hint::spin_loop();
+            },
         }
     }
 }
@@ -365,7 +368,11 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
     }
 
     pub fn enter(&self, id: NumericType) -> Result<NumberId, EnterError> {
-        self.enter_from(id, self.track().min())
+        let result = self.track().enter(id);
+        if let Ok(number) = result {
+            self.signal(number);
+        }
+        result
     }
 
     pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
@@ -450,7 +457,8 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             // get_slot_concurrent, and by extension `number` is just an indexing operation, they never return a NotFound error since NotFound checks additionally for whether the slot contains the actual id key.
             Err(NumberError::NotFound) => unreachable!(),
             // Only value updates return these.
-            Err(NumberError::PassedTarget(_)) | Err(NumberError::Exceeded(_)) | Err(NumberError::CasFailed) => unreachable!(),
+            Err(NumberError::PassedTarget(_)) | Err(NumberError::Exceeded(_)) | Err(NumberError::CasFailed)
+            | Err(NumberError::Suspended) | Err(NumberError::NotSuspended) | Err(NumberError::ExactFailed) => unreachable!(),
         }
     }
 
@@ -466,7 +474,8 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
             // get_slot_concurrent, and by extension `number` is just an indexing operation, they never return a NotFound error since NotFound checks additionally for whether the slot contains the actual id key.
             Err(NumberError::NotFound) => unreachable!(),
             // Only value updates return these.
-            Err(NumberError::PassedTarget(_)) | Err(NumberError::Exceeded(_)) | Err(NumberError::CasFailed) => unreachable!(),
+            Err(NumberError::PassedTarget(_)) | Err(NumberError::Exceeded(_)) | Err(NumberError::CasFailed)
+            | Err(NumberError::Suspended) | Err(NumberError::NotSuspended) | Err(NumberError::ExactFailed) => unreachable!(),
         }
     }
 
@@ -755,6 +764,30 @@ impl<'a, 'b, const L: u32, const I: NumericType> NumberWaiting<'a, 'b, L, I> {
 
     pub fn adds_within(&self, delta: NumericType, limit: NumericType) -> Result<NumericType, NumberError> {
         let result = self.inner.adds_within(delta, limit);
+        self.signal_change();
+        result
+    }
+
+    pub fn suspend(&self) -> Result<NumericType, NumberError> {
+        let result = self.inner.suspend();
+        self.signal_change();
+        result
+    }
+
+    pub fn resume(&self) -> Result<NumericType, NumberError> {
+        let result = self.inner.resume();
+        self.signal_change();
+        result
+    }
+
+    pub fn resume_from(&self, at_least: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.resume_from(at_least);
+        self.signal_change();
+        result
+    }
+
+    pub fn resume_at(&self, at: NumericType) -> Result<NumericType, NumberError> {
+        let result = self.inner.resume_at(at);
         self.signal_change();
         result
     }

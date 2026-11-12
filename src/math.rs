@@ -74,6 +74,15 @@ pub const fn max3_masked(a: NumericType, b: NumericType, c: NumericType, mask: N
 }
 
 #[inline]
+pub const fn max2_special_masked(a: NumericType, b: NumericType, special: bool, mask: NumericType) -> Option<NumericType> {
+    if lt_masked(a, b, mask) {
+        if special { None } else { Some(b) }
+    } else {
+        Some(a)
+    }
+}
+
+#[inline]
 pub const fn max3_special_masked(a: NumericType, b: NumericType, c: NumericType, special: bool, mask: NumericType) -> Option<NumericType> {
     let bc = if gte_masked(b, c, mask) { b } else { c };
     if lt_masked(a, bc, mask) {

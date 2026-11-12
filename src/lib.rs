@@ -50,7 +50,7 @@ pub mod futex;
 
 use MSB as SUSPENDED_BIT;
 
-use crate::math::{gte_masked, is_valid_user_bit_low, lt_masked, max2_masked, max3_special_masked, min2_masked, number_mask, user_mask};
+use crate::math::{gte_masked, is_valid_user_bit_low, lt_masked, max2_masked, max2_special_masked, min2_masked, number_mask, user_mask};
 
 const EMPTY_ID: NumericType = 0;
 const KEY_LOCK_BIT: NumericType = SUSPENDED_BIT;
@@ -208,6 +208,9 @@ pub enum NumberError {
     Exceeded(NumericType),
     /// A `try_*` lost on the compare-exchange to a concurrent change.
     CasFailed,
+    Suspended,
+    NotSuspended,
+    ExactFailed,
 }
 
 pub struct Number<'a, const USER_BIT_LOW: u32 = { NumericType::BITS }> {
@@ -344,7 +347,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
     }
 
     pub fn enter(&self, id: NumericType) -> Result<NumberId, EnterError> {
-        self.enter_from(id, self.min())
+        self.__enter_from(id, None, false)
     }
 
     /// Recover a [`NumberId`] from a key. This is usually fast but since it *can* scan the whole ring, keeping the [`NumberId`] directly is better.
@@ -397,57 +400,49 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
             Err(NumberError::InvalidOffset) => return Err(LeaveError::InvalidOffset),
             Err(NumberError::InvalidId) | Err(NumberError::NotFound) => return Err(LeaveError::NotFound),
             // Only value updates return these.
-            Err(NumberError::PassedTarget(_)) | Err(NumberError::Exceeded(_)) | Err(NumberError::CasFailed) => unreachable!(),
+            Err(NumberError::PassedTarget(_)) | Err(NumberError::Exceeded(_)) | Err(NumberError::CasFailed)
+            | Err(NumberError::Suspended) | Err(NumberError::NotSuspended) | Err(NumberError::ExactFailed) => unreachable!(),
         };
 
         loop {
-            let key_before = slot.id.load(Ordering::Acquire);
-            if key_before != number.id {
-                return Err(LeaveError::NotFound);
+            match slot.id.compare_exchange_weak(number.id, lock_key(number.id), Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) if actual == lock_key(number.id) => core::hint::spin_loop(), // an enter, resume, or another leave is happening
+                Err(actual) if actual == number.id => {}, // spurious failure
+                Err(_) => return Err(LeaveError::NotFound),
             }
+        }
 
+        loop {
             let current = slot.value.load(Ordering::Acquire);
-            if is_suspended(current) {
-                // Only initialization and leaving paths create suspended values, so if we see that the value is suspended here, another leave already did the job.
-                return Ok(());
-            }
-
-            let key_after = slot.id.load(Ordering::Acquire);
-            if key_before != key_after {
-                core::hint::spin_loop();
-                continue;
-            }
-
             let desired_value = if __concurrent_write_leave {
                 current.wrapping_add(1) & Self::NUMBER_MASK
             } else {
                 current & Self::NUMBER_MASK
             };
-
             let desired = with_suspended_bit(desired_value);
-
-            match slot
-                .value
-                .compare_exchange(current, desired, Ordering::AcqRel, Ordering::Acquire)
+            if current == desired
+                || slot
+                    .value
+                    .compare_exchange(current, desired, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
             {
-                Ok(_) => {
-                    slot.id.store(EMPTY_ID, Ordering::Release);
-                    return Ok(());
-                }
-                Err(_) => {
-                    core::hint::spin_loop();
-                    continue;
-                }
+                break;
             }
+            core::hint::spin_loop();
         }
+
+        slot.id.store(EMPTY_ID, Ordering::Release);
+
+        Ok(())
     }
 
     #[inline(always)]
-    fn __enter_from(&self, id: NumericType, at_least: NumericType, __exact: bool) -> Result<NumberId, EnterError> {
+    fn __enter_from(&self, id: NumericType, at: Option<NumericType>, __exact: bool) -> Result<NumberId, EnterError> {
         if id == EMPTY_ID || is_key_locked(id) {
             return Err(EnterError::InvalidId);
         }
-        if !is_valid_public_value(at_least) {
+        if at.is_some_and(|at| !is_valid_public_value(at)) {
             return Err(EnterError::InvalidValue);
         }
 
@@ -472,18 +467,20 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
                     let current = slot.value.load(Ordering::Acquire);
                     debug_assert!(is_suspended(current));
 
-                    // Resume from max(current_lane_floor, global_min, at_least)
-                    let three_way_max = max3_special_masked(
-                        at_least,
-                        without_suspended_bit(current),
-                        self.min.load(Ordering::Acquire),
-                        __exact,
-                        Self::NUMBER_MASK,
-                    );
+                    // Resume from max(current_floor, at)
+                    let two_way_max = match at {
+                        None => Some(without_suspended_bit(current)),
+                        Some(at) => max2_special_masked(
+                            at,
+                            without_suspended_bit(current),
+                            __exact,
+                            Self::NUMBER_MASK,
+                        ),
+                    };
 
                     let desired;
-                    if let Some(three_way_max) = three_way_max {
-                        desired = (three_way_max & Self::NUMBER_MASK) | I;
+                    if let Some(two_way_max) = two_way_max {
+                        desired = (two_way_max & Self::NUMBER_MASK) | I;
                     } else {
                         // Release the slot we locked since we're not using it
                         slot.id.store(EMPTY_ID, Ordering::Release);
@@ -503,8 +500,11 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
                                 id,
                                 offset: probe_offset as u64,
                             });
-                        }
-                        Err(_) => continue,
+                        },
+                        Err(_) => {
+                            core::hint::spin_loop();
+                            continue;
+                        },
                     }
                 }
             }
@@ -514,11 +514,11 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
     }
 
     pub fn enter_from(&self, id: NumericType, at_least: NumericType) -> Result<NumberId, EnterError> {
-        self.__enter_from(id, at_least, false)
+        self.__enter_from(id, Some(at_least), false)
     }
 
     pub fn enter_at(&self, id: NumericType, at: NumericType) -> Result<NumberId, EnterError> {
-        self.__enter_from(id, at, true)
+        self.__enter_from(id, Some(at), true)
     }
 
     #[inline(always)]
@@ -593,7 +593,10 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
                     Ordering::Acquire,
                 ) {
                     Ok(_) => continue 'outer,
-                    Err(actual) => current = actual,
+                    Err(actual) => {
+                        current = actual;
+                        core::hint::spin_loop();
+                    },
                 }
             }
 
@@ -612,7 +615,10 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
                 Ordering::Acquire, // Failed comparison is only a load
             ) {
                 Ok(previous) => break previous,
-                Err(actual) => current = actual,
+                Err(actual) => {
+                    current = actual;
+                    core::hint::spin_loop();
+                },
             }
         };
 
@@ -657,10 +663,15 @@ impl<'a, const L: u32> Number<'a, L> {
     const NUMBER_MASK: NumericType = number_mask(L);
     const USER_MASK: NumericType = user_mask(L);
 
-    pub fn get(&self) -> Result<NumericType, NumberError> {
+    #[inline]
+    fn get_value(&self) -> Result<NumericType, NumberError> {
         loop {
             let key_before = self.slot.id.load(Ordering::Acquire);
             if key_before != self.id {
+                if key_before == lock_key(self.id) {
+                    core::hint::spin_loop();
+                    continue;
+                }
                 return Err(NumberError::NotFound);
             }
 
@@ -671,12 +682,29 @@ impl<'a, const L: u32> Number<'a, L> {
                 continue;
             }
 
-            if is_suspended(value) {
-                return Err(NumberError::NotFound);
-            }
-
-            return Ok(without_suspended_bit(value));
+            return Ok(value);
         }
+    }
+
+    /// Lock this number by setting the lock bit on the its id (see [`AtomicTrack::__leave`]).
+    #[inline]
+    fn lock(&self) -> Result<(), NumberError> {
+        loop {
+            match self.slot.id.compare_exchange_weak(self.id, lock_key(self.id), Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(()),
+                Err(actual) if actual == lock_key(self.id) => core::hint::spin_loop(), // an enter, resume, or leave is happening
+                Err(actual) if actual == self.id => {}, // spurious failure
+                Err(_) => return Err(NumberError::NotFound),
+            }
+        }
+    }
+
+    pub fn get(&self) -> Result<NumericType, NumberError> {
+        let value = self.get_value()?;
+        if is_suspended(value) {
+            return Err(NumberError::Suspended);
+        }
+        Ok(value)
     }
 
     pub fn raise_to(&self, at_least: NumericType) -> Result<NumericType, NumberError> {
@@ -716,20 +744,9 @@ impl<'a, const L: u32> Number<'a, L> {
         );
 
         loop {
-            let key_before = self.slot.id.load(Ordering::Acquire);
-            if key_before != self.id {
-                return Err(NumberError::NotFound);
-            }
-
-            let current = self.slot.value.load(Ordering::Acquire);
+            let current = self.get_value()?;
             if is_suspended(current) {
-                return Err(NumberError::NotFound);
-            }
-
-            let key_after = self.slot.id.load(Ordering::Acquire);
-            if key_before != key_after {
-                core::hint::spin_loop();
-                continue;
+                return Err(NumberError::Suspended);
             }
 
             let number = if __strict {
@@ -793,20 +810,9 @@ impl<'a, const L: u32> Number<'a, L> {
     #[inline(always)]
     fn __add(&self, delta: NumericType, limit: Option<NumericType>, __set_user_bits: bool) -> Result<NumericType, NumberError> {
         loop {
-            let key_before = self.slot.id.load(Ordering::Acquire);
-            if key_before != self.id {
-                return Err(NumberError::NotFound);
-            }
-
-            let current = self.slot.value.load(Ordering::Acquire);
+            let current = self.get_value()?;
             if is_suspended(current) {
-                return Err(NumberError::NotFound);
-            }
-
-            let key_after = self.slot.id.load(Ordering::Acquire);
-            if key_before != key_after {
-                core::hint::spin_loop();
-                continue;
+                return Err(NumberError::Suspended);
             }
 
             if let Some(limit) = limit {
@@ -834,6 +840,92 @@ impl<'a, const L: u32> Number<'a, L> {
                 }
             }
         }
+    }
+
+    /// Suspend the number so that [`AtomicTrack::find_min`] begins pushing it forward rather as treating it as party to
+    /// determining the minimum. After a number is put in suspended state, directly modifying the number without atomic compare
+    /// exchange (through direct [`Number::atomic`], for instance) becomes riskier for that reason. The benefit is that it is able to
+    /// maintain its current slot, so re-entering maintains the same atomic. User bits are also kept across suspends. Returns
+    /// the last value before it was successfully put into suspend, or an error otherwise.
+    pub fn suspend(&self) -> Result<NumericType, NumberError> {
+        loop {
+            let current = self.get_value()?;
+            if is_suspended(current) {
+                return Err(NumberError::Suspended);
+            }
+            match self.slot.value.compare_exchange(
+                current,
+                with_suspended_bit(current),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(current),
+                Err(_) => {
+                    core::hint::spin_loop();
+                    continue;
+                },
+            }
+        }
+    }
+
+    /// Resume at own floor.
+    pub fn resume(&self) -> Result<NumericType, NumberError> {
+        self.__resume(None, false)
+    }
+
+    /// Resume at `max(own floor, at_least)`.
+    pub fn resume_from(&self, at_least: NumericType) -> Result<NumericType, NumberError> {
+        self.__resume(Some(at_least), false)
+    }
+
+    /// Resume at exactly `at` or fail with [`NumberError::ExactFailed`] and stay suspended.
+    pub fn resume_at(&self, at: NumericType) -> Result<NumericType, NumberError> {
+        self.__resume(Some(at), true)
+    }
+
+    #[inline(always)]
+    fn __resume(&self, at: Option<NumericType>, __exact: bool) -> Result<NumericType, NumberError> {
+        if let Some(at) = at {
+            debug_assert!(
+                is_valid_public_value(at),
+                "at must fit in the public number range"
+            );
+        }
+
+        // Set the lock bit on the id before re-entering since a concurrent leave call shouldn't simultaneously clear a
+        // slot whose value resume is making active, with an active value in an empty slot (tearing) as a result
+        self.lock()?;
+        let result = loop {
+            let current = self.slot.value.load(Ordering::Acquire);
+            if !is_suspended(current) {
+                break Err(NumberError::NotSuspended);
+            }
+
+            let floor = current & Self::NUMBER_MASK;
+            let target = match at {
+                None => floor,
+                Some(at) => match max2_special_masked(at, floor, __exact, Self::NUMBER_MASK) {
+                    Some(target) => target,
+                    None => break Err(NumberError::ExactFailed),
+                },
+            };
+            let desired = (target & Self::NUMBER_MASK) | (current & Self::USER_MASK);
+            match self.slot.value.compare_exchange(
+                current,
+                desired,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break Ok(desired),
+                Err(_) => {
+                    // This happens if find_min raises the value concurrently. Retry if that's the case.
+                    core::hint::spin_loop();
+                    continue;
+                },
+            }
+        };
+        self.slot.id.store(self.id, Ordering::Release);
+        result
     }
 
     /// # Safety
