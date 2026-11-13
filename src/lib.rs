@@ -352,11 +352,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
 
     /// Recover a [`NumberId`] from a key. This is usually fast but since it *can* scan the whole ring, keeping the [`NumberId`] directly is better.
     pub fn recover(&self, id: NumericType) -> Option<NumberId> {
-        if let Some((number_id, false)) = self.__recover(id) {
-            Some(number_id)
-        } else {
-            None
-        }
+        self.__recover(id)
     }
 
     /// Just like [`recover`](`AtomicTrack::recover`), this is usually fast but since it *can* scan the whole ring, using [`with_number`](`AtomicTrack::with_number`) is better if you can.
@@ -445,6 +441,10 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
         if at.is_some_and(|at| !is_valid_public_value(at)) {
             return Err(EnterError::InvalidValue);
         }
+        debug_assert!(
+            at.is_none_or(|at| at & !Self::NUMBER_MASK == 0),
+            "at must only have number bits set"
+        );
 
         let start_idx = self.index_for(id);
 
@@ -522,7 +522,7 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
     }
 
     #[inline(always)]
-    fn __recover(&self, id: NumericType) -> Option<(NumberId, bool)> {
+    fn __recover(&self, id: NumericType) -> Option<NumberId> {
         if id == EMPTY_ID || is_key_locked(id) {
             return None;
         }
@@ -531,15 +531,17 @@ impl<const L: u32, const I: NumericType> AtomicTrack<[CachePadded<Slot>], L, I> 
         for probe_offset in 0..self.slots.len() {
             let index = (base_index + probe_offset) & self.mask();
             let slot = &self.slots[index];
-            let current = slot.id.load(Ordering::Acquire);
-            if key_bits(current) == id {
-                return Some((
-                    NumberId {
-                        id,
-                        offset: probe_offset as u64,
-                    },
-                    is_key_locked(current),
-                ));
+            let mut current = slot.id.load(Ordering::Acquire);
+            // A locked id means that an enter, resume, or leave is currently happening, so wait until it is done first.
+            while current == lock_key(id) {
+                core::hint::spin_loop();
+                current = slot.id.load(Ordering::Acquire);
+            }
+            if current == id {
+                return Some(NumberId {
+                    id,
+                    offset: probe_offset as u64,
+                });
             }
         }
 
@@ -887,8 +889,8 @@ impl<'a, const L: u32> Number<'a, L> {
     fn __resume(&self, at: Option<NumericType>, __exact: bool) -> Result<NumericType, NumberError> {
         if let Some(at) = at {
             debug_assert!(
-                is_valid_public_value(at),
-                "at must fit in the public number range"
+                at & !Self::NUMBER_MASK == 0,
+                "at must only have number bits set"
             );
         }
 
@@ -1463,6 +1465,25 @@ mod tests {
         assert_eq!(track.recover(2), None);
         let b = track.enter_at(2, 100).unwrap(); // not AlreadyPresent / Full since the slot was released
         assert_eq!(track.number(b).unwrap().get(), Ok(100));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "at must only have number bits set")]
+    fn enter_at_with_user_bits_panics_in_debug() {
+        let track = ArrayAtomicTrack::<1, ONE_USER_BIT>::new();
+        let _ = track.enter_at(1, FLAG | 5);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "at must only have number bits set")]
+    fn resume_at_with_user_bits_panics_in_debug() {
+        let track = ArrayAtomicTrack::<1, ONE_USER_BIT>::new();
+        let a = track.enter(1).unwrap();
+        let number = track.number(a).unwrap();
+        number.suspend().unwrap();
+        let _ = number.resume_at(FLAG | 5);
     }
 
     #[test]

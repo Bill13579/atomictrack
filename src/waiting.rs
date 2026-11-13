@@ -555,7 +555,7 @@ impl<const L: u32, const I: NumericType> AtomicTrackWaiting<L, I> {
                 futex_value_before = arm_futex(f.get_or_insert_with(&futex_getter).0); // Arm the futex and get the armed value before checking the number. Later on if the number is not gte at_least, we can load this value again, and if it has changed in between, we know that the number has changed as well (though spurious wakeups are possible).
             }
 
-            //NOTE: `recover` returns None and stops probing if it finds a slot with the right key but that is still locked, but this is fine because if it's locked it should soon be unlocked, at which point the thread that finished adding in the id to the slot will wake this thread up again, and it will recheck, and recover will then find it this time, so given the contract of finding whatever was the first to be found in the ring with the provided id, this is good.
+            //NOTE: `recover` spins until the id lock on a slot with the right key clears, so a number in the middle of an enter or a resume is found.
             if let Some(number_id) = self.track().recover(id) {
                 return Ok(number_id);
             }
@@ -1471,19 +1471,33 @@ mod tests {
     }
 
     #[test]
-    fn recover_ignores_an_entry_that_is_still_locked() {
+    fn recover_waits_out_a_locked_entry() {
         let track = AtomicTrackWaiting::new_default(1);
         let inner = track.track();
         let slot = &inner.slots[0];
-
-        slot.id.store(lock_key(7), Ordering::Release);
-        assert_eq!(track.recover(7), None);
-
-        slot.value.store(0, Ordering::Release);
-        slot.id.store(7, Ordering::Release);
         let number_id = NumberId { id: 7, offset: 0 };
-        assert_eq!(track.recover(7), Some(number_id));
+
+        // Locked by an enter (or a resume) and found once it unlocks.
+        slot.id.store(lock_key(7), Ordering::Release);
+        thread::scope(|scope| {
+            let recovering = scope.spawn(|| track.recover(7));
+            thread::sleep(Duration::from_millis(20));
+            assert!(!recovering.is_finished());
+            slot.value.store(0, Ordering::Release);
+            slot.id.store(7, Ordering::Release);
+            assert_eq!(recovering.join().unwrap(), Some(number_id));
+        });
         track.leave(number_id).unwrap();
+
+        // Locked by a leave, so it shouldn't exist after.
+        slot.id.store(lock_key(7), Ordering::Release);
+        thread::scope(|scope| {
+            let recovering = scope.spawn(|| track.recover(7));
+            thread::sleep(Duration::from_millis(20));
+            assert!(!recovering.is_finished());
+            slot.id.store(EMPTY_ID, Ordering::Release);
+            assert_eq!(recovering.join().unwrap(), None);
+        });
     }
 
     #[test]

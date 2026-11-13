@@ -284,9 +284,10 @@ mod imp {
 
     type CLong = isize;
 
-    #[cfg(any(target_arch = "m68k", target_arch = "riscv32"))]
+    // x32 has 32-bit pointers and `long`, but its timespec fields are both 64-bit.
+    #[cfg(any(target_arch = "m68k", target_arch = "riscv32", all(target_arch = "x86_64", target_pointer_width = "32")))]
     type TimeUnit = i64;
-    #[cfg(not(any(target_arch = "m68k", target_arch = "riscv32")))]
+    #[cfg(not(any(target_arch = "m68k", target_arch = "riscv32", all(target_arch = "x86_64", target_pointer_width = "32"))))]
     type TimeUnit = CLong;
 
     #[repr(C)]
@@ -586,7 +587,10 @@ mod tests {
 
         let worker = thread::spawn(move || {
             worker_ready.store(1, Ordering::Release);
-            wait(&worker_atomic, 0, pinfo);
+            // A wait can return spuriously.
+            while worker_atomic.load(Ordering::Acquire) == 0 {
+                wait(&worker_atomic, 0, pinfo);
+            }
             assert_eq!(worker_atomic.load(Ordering::Acquire), 1);
         });
 

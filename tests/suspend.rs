@@ -143,3 +143,30 @@ fn resume_vs_concurrent_leave() {
         assert_eq!(track.recover(1), None);
     }
 }
+
+/// A number that stays entered is always found by its id, including while its owner is resuming it.
+#[test]
+fn recover_finds_a_number_while_it_suspends_and_resumes() {
+    let iterations = if cfg!(miri) { 200 } else { 500_000 };
+    let track = Arc::new(ArrayAtomicTrack::<4>::new());
+    let a = track.enter(1).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let owner = {
+        let (track, stop) = (track.clone(), stop.clone());
+        thread::spawn(move || {
+            let n = track.number(a).unwrap();
+            while !stop.load(Ordering::Acquire) {
+                n.suspend().unwrap();
+                n.resume().unwrap();
+            }
+        })
+    };
+
+    for _ in 0..iterations {
+        assert_eq!(track.recover(1), Some(a));
+        assert!(track.with_id(1, |_| ()).is_ok());
+    }
+    stop.store(true, Ordering::Release);
+    owner.join().unwrap();
+}
